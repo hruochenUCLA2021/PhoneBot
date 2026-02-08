@@ -30,11 +30,13 @@ import com.example.phonebot_app_android.sensors.ImuMonitor
 import com.example.phonebot_app_android.sensors.ImuState
 import com.example.phonebot_app_android.system.BatteryMonitor
 import com.example.phonebot_app_android.ui.theme.PhoneBot_App_AndroidTheme
+import android.view.WindowManager
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent {
             PhoneBot_App_AndroidTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -101,8 +103,14 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                 lines =
                     listOf(
                         "timestamp(ns): ${imu.timestampNs}",
+                        formatHz("rotVec(Hz)", imu.rotVecHz),
+                        formatHz("gameRot(Hz)", imu.gameRotVecHz),
+                        formatHz("accel(Hz)", imu.accelHz),
+                        formatHz("gyro(Hz)", imu.gyroHz),
                         formatQuat(imu.quat),
                         formatYpr(imu.yprDeg),
+                        formatQuat("gameQuat", imu.gameQuat),
+                        formatYpr("gameYPR", imu.gameYprDeg),
                         formatVec3("accel(m/s^2)", imu.accel),
                         formatVec3("gyro(rad/s)", imu.gyro),
                     )
@@ -132,19 +140,28 @@ private fun MonoBlock(lines: List<String>) {
     }
 }
 
-private fun formatQuat(q: FloatArray?): String {
+private fun formatQuat(q: FloatArray?): String = formatQuat("quat", q)
+
+private fun formatQuat(label: String, q: FloatArray?): String {
     if (q == null || q.size < 4) return "quat[w,x,y,z]: ?"
-    return "quat[w,x,y,z]: ${q[0].fmt()}, ${q[1].fmt()}, ${q[2].fmt()}, ${q[3].fmt()}"
+    return "${label.padEnd(8)}[w,x,y,z]: ${q[0].fmt()}, ${q[1].fmt()}, ${q[2].fmt()}, ${q[3].fmt()}"
 }
 
-private fun formatYpr(yprDeg: FloatArray?): String {
-    if (yprDeg == null || yprDeg.size < 3) return "ypr(deg)     : ?"
-    return "ypr(deg)     : yaw=${yprDeg[0].fmt()} pitch=${yprDeg[1].fmt()} roll=${yprDeg[2].fmt()}"
+private fun formatYpr(yprDeg: FloatArray?): String = formatYpr("ypr(deg)", yprDeg)
+
+private fun formatYpr(label: String, yprDeg: FloatArray?): String {
+    if (yprDeg == null || yprDeg.size < 3) return "${label.padEnd(12)}: ?"
+    return "${label.padEnd(12)}: yaw=${yprDeg[0].fmt()} pitch=${yprDeg[1].fmt()} roll=${yprDeg[2].fmt()}"
 }
 
 private fun formatVec3(name: String, v: FloatArray?): String {
     if (v == null || v.size < 3) return "${name.padEnd(12)}: ?"
     return "${name.padEnd(12)}: ${v[0].fmt()}, ${v[1].fmt()}, ${v[2].fmt()}"
+}
+
+private fun formatHz(name: String, hz: Float?): String {
+    if (hz == null) return "${name.padEnd(12)}: ?"
+    return "${name.padEnd(12)}: ${hz.fmt()} Hz"
 }
 
 private fun Float.fmt(): String = "% .4f".format(this)
