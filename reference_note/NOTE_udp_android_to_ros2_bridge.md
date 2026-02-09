@@ -33,10 +33,13 @@ The bridge publishes:
 - `/phonebot/imu` (`sensor_msgs/Imu`) from `rotvec`
 - `/phonebot/imu_game` (`sensor_msgs/Imu`) from `game_rotvec`
 - `/phonebot/battery` (`sensor_msgs/BatteryState`)
+- `/phonebot/motor_state` (`sensor_msgs/JointState`) from motor present state in the sensor UDP packet (v2)
 
 Notes:
 - In ROS `sensor_msgs/Imu`, quaternion is **ROS order** `(x,y,z,w)`; the bridge converts from Android `[w,x,y,z]`.
 - Accel/gyro are reused for both topics.
+- Motor state:
+  - `position[]` and `velocity[]` are published if the Android packet includes them (protocol v2).
 
 ### PC → Android motor command (UDP return path)
 

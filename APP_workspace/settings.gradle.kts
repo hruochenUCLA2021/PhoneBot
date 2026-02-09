@@ -16,6 +16,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // For usb-serial-for-android (if not available on Maven Central in your environment)
+        maven(url = "https://jitpack.io")
     }
 }
 

@@ -48,6 +48,9 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
 
+    // USB-Serial (USB-C -> USB to Serial adapters like FTDI/CH340/CP210x)
+    implementation("com.github.mik3y:usb-serial-for-android:3.8.1")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

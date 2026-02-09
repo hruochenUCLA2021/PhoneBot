@@ -23,11 +23,11 @@ Binary struct (Python `struct`): `<4sBBHIQ`
 
 ---
 
-## Packet type 1: SENSOR (Android → PC) — 116 bytes total
+## Packet type 1: SENSOR (Android → PC) — 220 bytes total (Protocol v2)
 
 This is sent from the Android app to the PC on each rotation-vector update (and includes latest accel/gyro/battery snapshot).
 
-### Layout after header (96 bytes payload)
+### Layout after header (200 bytes payload)
 | Field | Type | Count | Bytes |
 |---|---:|---:|---:|
 | `accel_xyz` | `float32` | 3 | 12 |
@@ -43,8 +43,13 @@ This is sent from the Android app to the PC on each rotation-vector update (and 
 | `battery_plugged` | `u8` | 1 | 1 |
 | `battery_status` | `u8` | 1 | 1 |
 | `reserved` | `u8` | 1 | 1 |
+| `motor_pos_rad` | `float32` | 13 | 52 |
+| `motor_vel_rad_s` | `float32` | 13 | 52 |
 
-Binary struct (Python `struct`): `<4sBBHIQ3f3ff4f3ff4f3ff4B`
+Binary struct (Python `struct`): `<4sBBHIQ3f3ff4f3ff4f3ff4B26f`
+
+### Header flags (`flags` u16)
+- bit0 (`1`): motor state valid (`motor_pos_rad` / `motor_vel_rad_s` contain real values)
 
 ### Enumerations
 `battery_is_charging`:

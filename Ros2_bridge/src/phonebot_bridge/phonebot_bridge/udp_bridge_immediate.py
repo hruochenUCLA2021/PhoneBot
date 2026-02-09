@@ -40,6 +40,7 @@ class UdpToRos2ImmediateBridge(Node):
         self.pub_imu = self.create_publisher(Imu, f"/{topic_ns}/imu", 10)
         self.pub_imu_game = self.create_publisher(Imu, f"/{topic_ns}/imu_game", 10)
         self.pub_batt = self.create_publisher(BatteryState, f"/{topic_ns}/battery", 10)
+        self.pub_motor_state = self.create_publisher(JointState, f"/{topic_ns}/motor_state", 10)
 
         # Subscribe to motor commands and forward immediately to Android via UDP.
         self._motor_sub = self.create_subscription(JointState, motor_topic, self._on_motor_cmd, 10)
@@ -120,6 +121,17 @@ class UdpToRos2ImmediateBridge(Node):
 
         bmsg.power_supply_status = _map_battery_status_code(pkt.batt_status)
         self.pub_batt.publish(bmsg)
+
+        # Motor present state (from sensor packet v2)
+        if pkt.motor_pos_rad is not None and pkt.motor_vel_rad_s is not None:
+            j = JointState()
+            j.header.stamp = now
+            j.header.frame_id = "phone"
+            j.name = [f"motor_{i}" for i in range(len(pkt.motor_pos_rad))]
+            j.position = [float(x) for x in pkt.motor_pos_rad]
+            j.velocity = [float(x) for x in pkt.motor_vel_rad_s]
+            # effort left empty
+            self.pub_motor_state.publish(j)
 
     def _on_motor_cmd(self, msg: JointState) -> None:
         """Forward motor command to Android immediately on receipt."""

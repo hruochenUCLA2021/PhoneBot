@@ -45,6 +45,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import com.example.phonebot_app_android.motors.dynamixel.DynamixelController
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,6 +71,15 @@ private data class MotorUiState(
     val pos: FloatArray? = null,
     val vel: FloatArray? = null,
     val tau: FloatArray? = null,
+    val note: String? = null,
+)
+
+private data class MotorFeedbackUiState(
+    val ctrlHz: Float? = null,
+    val rxHz: Float? = null,
+    val readHz: Float? = null,
+    val posRad: FloatArray? = null,
+    val velRadS: FloatArray? = null,
     val note: String? = null,
 )
 
@@ -100,6 +110,19 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val latestMotorRef =
         remember { AtomicReference<Pair<PhonebotProtocol.MotorPacket, Float?>?>(null) }
 
+    // Dynamixel USB motor control
+    val dxlController = remember { DynamixelController(context) }
+    var motorHwEnabled by remember { mutableStateOf(false) }
+    var motorHwStatus by remember { mutableStateOf("Motor HW: OFF") }
+    val dxlConfig = remember { DynamixelController.Config() } // default: ids 1..13, baud 1M, kp=5, kd=0.1
+    var motorFbUi by remember { mutableStateOf(MotorFeedbackUiState(note = "Motor feedback: not started")) }
+    val latestMotorFbRef =
+        remember { AtomicReference<DynamixelController.MotorStatus?>(null) }
+    val motorCtrlHzRef = remember { AtomicReference<Float?>(null) }
+    val motorReadHzRef = remember { AtomicReference<Float?>(null) }
+    val ctrlRate = remember { SimpleRateEstimator() }
+    val readRate = remember { SimpleRateEstimator() }
+
     DisposableEffect(Unit) {
         batteryMonitor.start()
 
@@ -107,7 +130,15 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
         imuMonitor.onRawUpdate = { sample ->
             if (remoteEnabled.get()) {
                 val seq = sensorSeq.incrementAndGet()
-                val payload = PhonebotProtocol.packSensorPacket(seq, sample, batteryMonitor.state.value)
+                val fb = latestMotorFbRef.get()
+                val payload =
+                    PhonebotProtocol.packSensorPacket(
+                        seq = seq,
+                        imu = sample,
+                        battery = batteryMonitor.state.value,
+                        motorPosRad = fb?.posRad,
+                        motorVelRadS = fb?.velRadS,
+                    )
                 udpSender.offer(payload)
             }
         }
@@ -123,6 +154,11 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             imuMonitor.stop()
             udpSender.stop()
             udpReceiver.stop()
+            // Best-effort torque-off on app exit
+            runCatching {
+                // fire-and-forget; don't block dispose
+                motorHwEnabled = false
+            }
         }
     }
 
@@ -145,6 +181,61 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     )
             }
             delay(50) // ~20 Hz
+        }
+    }
+
+    // Motor HW enable/disable lifecycle
+    LaunchedEffect(motorHwEnabled) {
+        if (motorHwEnabled) {
+            motorHwStatus = "Motor HW: enabling..."
+            val ok = dxlController.enable(dxlConfig)
+            motorHwStatus = if (ok) "Motor HW: ON (USB)" else "Motor HW: enable failed (${dxlController.lastStatus})"
+            if (!ok) {
+                motorHwEnabled = false
+                return@LaunchedEffect
+            }
+
+            motorFbUi = MotorFeedbackUiState(note = "Motor feedback: running (~20Hz UI)")
+
+            // While enabled, stream goals AND read feedback at 100 Hz.
+            // UI remains throttled elsewhere.
+            while (isActive && motorHwEnabled) {
+                val latest = latestMotorRef.get()
+                val pkt = latest?.first
+                if (pkt != null) {
+                    dxlController.sendGoalPositionsRad(dxlConfig, pkt.pos)
+                    motorCtrlHzRef.set(ctrlRate.update(System.nanoTime()))
+                }
+                val st = dxlController.readPresentPosVel(dxlConfig)
+                motorReadHzRef.set(readRate.update(System.nanoTime()))
+                latestMotorFbRef.set(st)
+                delay(10) // 100 Hz loop
+            }
+        } else {
+            motorHwStatus = "Motor HW: disabling..."
+            runCatching { dxlController.disable(dxlConfig) }
+            motorHwStatus = "Motor HW: OFF"
+            motorFbUi = MotorFeedbackUiState(note = "Motor feedback: stopped (motor HW off)")
+            latestMotorFbRef.set(null)
+        }
+    }
+
+    // Throttle motor feedback UI to ~20 Hz.
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            val st = latestMotorFbRef.get()
+            if (st != null) {
+                motorFbUi =
+                    MotorFeedbackUiState(
+                        ctrlHz = motorCtrlHzRef.get(),
+                        rxHz = st.rxHz,
+                        readHz = motorReadHzRef.get(),
+                        posRad = st.posRad?.copyOf(),
+                        velRadS = st.velRadS?.copyOf(),
+                        note = null,
+                    )
+            }
+            delay(50)
         }
     }
 
@@ -274,6 +365,39 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     ),
             )
 
+            SectionTitle("Motor HW (USB → Dynamixel XL430)")
+            MonoBlock(
+                lines =
+                    listOf(
+                        "status       : $motorHwStatus",
+                        "dxl note     : ${dxlController.lastStatus}",
+                        "ids          : 1..13 (default)",
+                        "baud         : 1,000,000",
+                        "mode         : position",
+                        "kp / kd      : 5 / 0.1 (kd maps to integer register)",
+                        "init goal    : 0 rad (~2048 ticks)",
+                        "cmd source   : UDP pos[13] (rad) @ 100Hz loop",
+                    ),
+            )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { motorHwEnabled = !motorHwEnabled },
+                ) { Text(if (motorHwEnabled) "Motor HW: ON (tap to OFF)" else "Motor HW: OFF (tap to ON)") }
+            }
+
+            SectionTitle("Motor Feedback (XL430 present state)")
+            motorFbUi.note?.let { MonoBlock(lines = listOf("note         : $it")) }
+            MonoBlock(
+                lines =
+                    listOf(
+                        formatHz("ctrl(Hz)", motorFbUi.ctrlHz),
+                        formatHz("dxlRx(Hz)", motorFbUi.rxHz),
+                        formatHz("read(Hz)", motorFbUi.readHz),
+                        formatFloatList("pos(rad)", motorFbUi.posRad),
+                        formatFloatList("vel(rad/s)", motorFbUi.velRadS),
+                    ),
+            )
+
             SectionTitle("IMU (fast sampling; UI throttled ~20Hz)")
             imu.note?.let { MonoBlock(lines = listOf("note         : $it")) }
 
@@ -366,5 +490,22 @@ private fun getLocalIpv4Address(): String? {
         null
     } catch (_: Throwable) {
         null
+    }
+}
+
+private class SimpleRateEstimator(private val alpha: Float = 0.1f) {
+    private var lastNs: Long = 0L
+    private var emaHz: Float? = null
+
+    fun update(nowNs: Long): Float? {
+        if (lastNs != 0L) {
+            val dt = nowNs - lastNs
+            if (dt > 0) {
+                val instHz = 1_000_000_000f / dt.toFloat()
+                emaHz = if (emaHz == null) instHz else (emaHz!! * (1 - alpha) + instHz * alpha)
+            }
+        }
+        lastNs = nowNs
+        return emaHz
     }
 }

@@ -13,7 +13,10 @@ from typing import Optional, Sequence, Tuple
 
 
 MAGIC = b"PBOT"
-VERSION = 1
+# v1: sensor packet only
+# v2: sensor packet includes motor present state (pos/vel[13]) and uses flags bit0.
+VERSION_V1 = 1
+VERSION_V2 = 2
 
 MSG_TYPE_SENSOR = 1
 MSG_TYPE_MOTOR = 2
@@ -25,9 +28,13 @@ MOTOR_COUNT = 13
 HEADER_FMT = "<4sBBHIQ"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 20
 
-# Sensor packet total: 116 bytes
-SENSOR_FMT = "<4sBBHIQ3f3ff4f3ff4f3ff4B"
-SENSOR_SIZE = struct.calcsize(SENSOR_FMT)  # 116
+# Sensor packet totals:
+# v1: 116 bytes
+SENSOR_FMT_V1 = "<4sBBHIQ3f3ff4f3ff4f3ff4B"
+SENSOR_SIZE_V1 = struct.calcsize(SENSOR_FMT_V1)  # 116
+# v2: 220 bytes (v1 + 26 float32)
+SENSOR_FMT_V2 = "<4sBBHIQ3f3ff4f3ff4f3ff4B26f"
+SENSOR_SIZE_V2 = struct.calcsize(SENSOR_FMT_V2)  # 220
 
 # Motor packet total: 176 bytes
 MOTOR_FMT = "<4sBBHIQ39f"
@@ -38,6 +45,7 @@ MOTOR_SIZE = struct.calcsize(MOTOR_FMT)  # 176
 class SensorPacket:
     seq: int
     ts_ns: int
+    flags: int
     accel: Tuple[float, float, float]
     gyro: Tuple[float, float, float]
     rot_hz: float
@@ -50,6 +58,8 @@ class SensorPacket:
     batt_is_charging: int
     batt_plugged: int
     batt_status: int
+    motor_pos_rad: Optional[Tuple[float, ...]] = None  # len 13 (v2)
+    motor_vel_rad_s: Optional[Tuple[float, ...]] = None  # len 13 (v2)
 
 
 @dataclass(frozen=True)
@@ -62,15 +72,30 @@ class MotorPacket:
 
 
 def try_parse_sensor(payload: bytes) -> Optional[SensorPacket]:
-    if len(payload) < SENSOR_SIZE:
+    # Support both v1 and v2 based on version + size.
+    if len(payload) < SENSOR_SIZE_V1:
         return None
     try:
-        unpacked = struct.unpack_from(SENSOR_FMT, payload, 0)
+        hdr = struct.unpack_from(HEADER_FMT, payload, 0)
     except struct.error:
         return None
 
-    magic, version, msg_type, _flags, seq, ts_ns = unpacked[0:6]
-    if magic != MAGIC or version != VERSION or msg_type != MSG_TYPE_SENSOR:
+    magic, version, msg_type, flags, seq, ts_ns = hdr
+    if magic != MAGIC or msg_type != MSG_TYPE_SENSOR:
+        return None
+
+    if version == VERSION_V2 and len(payload) >= SENSOR_SIZE_V2:
+        fmt = SENSOR_FMT_V2
+        size = SENSOR_SIZE_V2
+    elif version == VERSION_V1 and len(payload) >= SENSOR_SIZE_V1:
+        fmt = SENSOR_FMT_V1
+        size = SENSOR_SIZE_V1
+    else:
+        return None
+
+    try:
+        unpacked = struct.unpack_from(fmt, payload, 0)
+    except struct.error:
         return None
 
     # Unpacked layout after header:
@@ -103,10 +128,19 @@ def try_parse_sensor(payload: bytes) -> Optional[SensorPacket]:
     batt_is_charging = int(unpacked[i])
     batt_plugged = int(unpacked[i + 1])
     batt_status = int(unpacked[i + 2])
+    i += 4
+
+    motor_pos = None
+    motor_vel = None
+    if version == VERSION_V2 and fmt == SENSOR_FMT_V2:
+        motor_pos = tuple(float(x) for x in unpacked[i : i + 13])
+        i += 13
+        motor_vel = tuple(float(x) for x in unpacked[i : i + 13])
 
     return SensorPacket(
         seq=int(seq),
         ts_ns=int(ts_ns),
+        flags=int(flags),
         accel=accel,
         gyro=gyro,
         rot_hz=rot_hz,
@@ -119,6 +153,8 @@ def try_parse_sensor(payload: bytes) -> Optional[SensorPacket]:
         batt_is_charging=batt_is_charging,
         batt_plugged=batt_plugged,
         batt_status=batt_status,
+        motor_pos_rad=motor_pos,
+        motor_vel_rad_s=motor_vel,
     )
 
 

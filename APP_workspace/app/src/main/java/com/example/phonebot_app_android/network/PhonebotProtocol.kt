@@ -14,7 +14,8 @@ object PhonebotProtocol {
     // 4-byte magic: ASCII "PBOT"
     private val MAGIC = byteArrayOf('P'.code.toByte(), 'B'.code.toByte(), 'O'.code.toByte(), 'T'.code.toByte())
 
-    const val VERSION: Byte = 1
+    // v2: SENSOR packet additionally includes motor present state (pos/vel[13]) and uses flags bit0.
+    const val VERSION: Byte = 2
 
     const val MSG_TYPE_SENSOR: Byte = 1
     const val MSG_TYPE_MOTOR: Byte = 2
@@ -23,10 +24,14 @@ object PhonebotProtocol {
     const val HEADER_SIZE_BYTES: Int = 20
 
     // SENSOR packet total size (see NOTE_protocal.md): 116 bytes
-    const val SENSOR_PACKET_SIZE_BYTES: Int = 116
+    // v2: 116 + (26 float32) = 220 bytes
+    const val SENSOR_PACKET_SIZE_BYTES: Int = 220
 
     // MOTOR packet total size (see NOTE_protocal.md): 176 bytes
     const val MOTOR_PACKET_SIZE_BYTES: Int = 176
+    // Header flags
+    private const val FLAG_MOTOR_STATE_VALID: Int = 1 shl 0
+
 
     private const val MOTOR_COUNT: Int = 13
 
@@ -38,13 +43,23 @@ object PhonebotProtocol {
         val tau: FloatArray, // size 13
     )
 
-    fun packSensorPacket(seq: Long, imu: ImuState, battery: BatteryState): ByteArray {
+    fun packSensorPacket(
+        seq: Long,
+        imu: ImuState,
+        battery: BatteryState,
+        motorPosRad: FloatArray? = null,
+        motorVelRadS: FloatArray? = null,
+    ): ByteArray {
         val buf = ByteBuffer.allocate(SENSOR_PACKET_SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         // Header
         buf.put(MAGIC)
         buf.put(VERSION)
         buf.put(MSG_TYPE_SENSOR)
-        buf.putShort(0) // flags u16 (reserved)
+        val flags =
+            if (motorPosRad != null && motorVelRadS != null &&
+                motorPosRad.size >= MOTOR_COUNT && motorVelRadS.size >= MOTOR_COUNT
+            ) FLAG_MOTOR_STATE_VALID else 0
+        buf.putShort(flags.toShort()) // flags u16
         buf.putInt(seq.toInt()) // seq u32 (wrap ok)
         buf.putLong(imu.timestampNs)
 
@@ -84,6 +99,15 @@ object PhonebotProtocol {
         buf.put(mapPluggedToCode(battery.plugged))
         buf.put(mapStatusToCode(battery.status))
         buf.put(0) // reserved/padding
+
+        // v2 extension: motor present state (pos/vel), always present; use flags to indicate validity.
+        if (flags and FLAG_MOTOR_STATE_VALID != 0) {
+            for (i in 0 until MOTOR_COUNT) buf.putFloat(motorPosRad!![i])
+            for (i in 0 until MOTOR_COUNT) buf.putFloat(motorVelRadS!![i])
+        } else {
+            for (i in 0 until MOTOR_COUNT) buf.putFloat(0f)
+            for (i in 0 until MOTOR_COUNT) buf.putFloat(0f)
+        }
 
         return buf.array()
     }
