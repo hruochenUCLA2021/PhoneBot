@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'phonebot_udp_bridge_periodic = phonebot_bridge.udp_bridge_periodic:main',
             'phonebot_udp_bridge_immediate = phonebot_bridge.udp_bridge_immediate:main',
+            'phonebot_example_motor_pub = phonebot_bridge.example_motor_pub:main',
         ],
     },
 )

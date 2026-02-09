@@ -5,6 +5,8 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import kotlin.math.PI
 
@@ -34,12 +36,13 @@ class ImuMonitor(context: Context) : SensorEventListener {
     private val gyroscope: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
     // latest samples (updated at SENSOR_DELAY_FASTEST)
-    @Volatile private var latestQuat: FloatArray? = null
-    @Volatile private var latestYprDeg: FloatArray? = null
-    @Volatile private var latestGameQuat: FloatArray? = null
-    @Volatile private var latestGameYprDeg: FloatArray? = null
-    @Volatile private var latestAccel: FloatArray? = null
-    @Volatile private var latestGyro: FloatArray? = null
+    // Pre-allocate to avoid per-callback allocations/GC that can drop event rate.
+    @Volatile private var latestQuat: FloatArray = FloatArray(4) // [w,x,y,z]
+    @Volatile private var latestYprDeg: FloatArray = FloatArray(3) // [yaw,pitch,roll] deg
+    @Volatile private var latestGameQuat: FloatArray = FloatArray(4) // [w,x,y,z]
+    @Volatile private var latestGameYprDeg: FloatArray = FloatArray(3) // [yaw,pitch,roll] deg
+    @Volatile private var latestAccel: FloatArray = FloatArray(3) // [x,y,z]
+    @Volatile private var latestGyro: FloatArray = FloatArray(3) // [x,y,z]
     @Volatile private var latestTsNs: Long = 0L
 
     @Volatile private var latestRotVecHz: Float? = null
@@ -49,9 +52,21 @@ class ImuMonitor(context: Context) : SensorEventListener {
 
     // UI updates should be throttled; sensors can be 100-500+ Hz.
     @Volatile private var lastUiEmitElapsedMs: Long = 0L
+    // Also throttle expensive yaw/pitch/roll computation to UI rate.
+    @Volatile private var lastYprComputeElapsedMs: Long = 0L
+
+    // Temp arrays reused for Euler computation.
+    private val tmpR = FloatArray(9)
+    private val tmpO = FloatArray(3)
 
     var onUiUpdate: ((ImuState) -> Unit)? = null
-    /** Called on every sensor callback (no UI throttling). Intended for streaming/logging. */
+    /**
+     * Called without UI throttling, but ONLY when an orientation estimate updates
+     * (TYPE_ROTATION_VECTOR or TYPE_GAME_ROTATION_VECTOR). Intended for UDP streaming.
+     *
+     * This avoids triggering network sends on high-rate accel/gyro callbacks while still
+     * including the latest accel/gyro values in the snapshot payload.
+     */
     var onRawUpdate: ((ImuState) -> Unit)? = null
 
     private class RateEstimator(private val alpha: Float = 0.1f) {
@@ -81,6 +96,10 @@ class ImuMonitor(context: Context) : SensorEventListener {
     private val accelRate = RateEstimator()
     private val gyroRate = RateEstimator()
 
+    // Run sensor callbacks on a dedicated thread to avoid UI/main-thread contention dropping events.
+    private var sensorThread: HandlerThread? = null
+    private var sensorHandler: Handler? = null
+
     fun startFast() {
         val noteParts = mutableListOf<String>()
         if (rotationVector == null) {
@@ -90,25 +109,42 @@ class ImuMonitor(context: Context) : SensorEventListener {
             noteParts.add("No TYPE_GAME_ROTATION_VECTOR sensor on this device.")
         }
 
+        // Ensure a dedicated callback thread exists.
+        if (sensorThread == null) {
+            sensorThread =
+                HandlerThread("ImuMonitorThread").also {
+                    it.start()
+                    sensorHandler = Handler(it.looper)
+                }
+        }
+        val handler = sensorHandler
+
         // On newer Android versions, SENSOR_DELAY_FASTEST (0us) may require
         // android.permission.HIGH_SAMPLING_RATE_SENSORS. If not granted, fall back.
-        val fastestDelay = SensorManager.SENSOR_DELAY_FASTEST
-        val fallbackDelay = SensorManager.SENSOR_DELAY_GAME
+        // NOTE: asking *all* sensors for 0us can be CPU heavy. User requested FASTEST for all.
+        val gameFastestUs = 0 // stream trigger: fastest possible
+        val auxUs = 0 // fastest possible for accel/gyro + rotvec
+        val fallbackUs = 10_000 // 100 Hz as a reasonable fallback target
 
         try {
-            rotationVector?.also { sensorManager.registerListener(this, it, fastestDelay) }
-            gameRotationVector?.also { sensorManager.registerListener(this, it, fastestDelay) }
-            accelerometer?.also { sensorManager.registerListener(this, it, fastestDelay) }
-            gyroscope?.also { sensorManager.registerListener(this, it, fastestDelay) }
-            noteParts.add("IMU rate: FASTEST")
+            // Use the overload that accepts a Handler so callbacks are NOT on the main thread.
+            // Streaming trigger:
+            gameRotationVector?.also { sensorManager.registerListener(this, it, gameFastestUs, 0, handler) }
+
+            // Aux sensors (still useful, but don't need max rate for most robotics pipelines):
+            rotationVector?.also { sensorManager.registerListener(this, it, auxUs, 0, handler) }
+            accelerometer?.also { sensorManager.registerListener(this, it, auxUs, 0, handler) }
+            gyroscope?.also { sensorManager.registerListener(this, it, auxUs, 0, handler) }
+
+            noteParts.add("IMU: FASTEST (0us) on all sensors")
         } catch (se: SecurityException) {
             // Fall back to avoid crashing.
             sensorManager.unregisterListener(this)
-            rotationVector?.also { sensorManager.registerListener(this, it, fallbackDelay) }
-            gameRotationVector?.also { sensorManager.registerListener(this, it, fallbackDelay) }
-            accelerometer?.also { sensorManager.registerListener(this, it, fallbackDelay) }
-            gyroscope?.also { sensorManager.registerListener(this, it, fallbackDelay) }
-            noteParts.add("IMU rate: GAME (FASTEST blocked: ${se.message ?: "SecurityException"})")
+            rotationVector?.also { sensorManager.registerListener(this, it, fallbackUs, 0, handler) }
+            gameRotationVector?.also { sensorManager.registerListener(this, it, fallbackUs, 0, handler) }
+            accelerometer?.also { sensorManager.registerListener(this, it, fallbackUs, 0, handler) }
+            gyroscope?.also { sensorManager.registerListener(this, it, fallbackUs, 0, handler) }
+            noteParts.add("IMU: ~100Hz (FASTEST blocked: ${se.message ?: "SecurityException"})")
         }
 
         onUiUpdate?.invoke(ImuState(note = noteParts.joinToString(" | ").ifBlank { null }))
@@ -120,82 +156,85 @@ class ImuMonitor(context: Context) : SensorEventListener {
         gameRotVecRate.reset()
         accelRate.reset()
         gyroRate.reset()
+
+        sensorThread?.quitSafely()
+        sensorThread = null
+        sensorHandler = null
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     override fun onSensorChanged(event: SensorEvent) {
         latestTsNs = event.timestamp
+        val isGameOrientationUpdate = event.sensor.type == Sensor.TYPE_GAME_ROTATION_VECTOR
+        val nowMs = SystemClock.elapsedRealtime()
 
         when (event.sensor.type) {
             Sensor.TYPE_ROTATION_VECTOR -> {
                 latestRotVecHz = rotVecRate.update(event.timestamp)
-                // Quaternion
-                val q = FloatArray(4)
-                SensorManager.getQuaternionFromVector(q, event.values)
-                latestQuat = q // [w,x,y,z]
+                // Quaternion (writes into our preallocated array)
+                SensorManager.getQuaternionFromVector(latestQuat, event.values)
 
-                // Euler (yaw/pitch/roll) from rotation matrix
-                val r = FloatArray(9)
-                val o = FloatArray(3)
-                SensorManager.getRotationMatrixFromVector(r, event.values)
-                SensorManager.getOrientation(r, o) // radians: [azimuth(yaw), pitch, roll]
-                latestYprDeg =
-                    floatArrayOf(
-                        radToDeg(o[0]),
-                        radToDeg(o[1]),
-                        radToDeg(o[2]),
-                    )
+                // Euler is expensive: compute only at UI-like rate.
+                if (nowMs - lastYprComputeElapsedMs >= 50) {
+                    lastYprComputeElapsedMs = nowMs
+                    SensorManager.getRotationMatrixFromVector(tmpR, event.values)
+                    SensorManager.getOrientation(tmpR, tmpO) // radians: [azimuth(yaw), pitch, roll]
+                    latestYprDeg[0] = radToDeg(tmpO[0])
+                    latestYprDeg[1] = radToDeg(tmpO[1])
+                    latestYprDeg[2] = radToDeg(tmpO[2])
+                }
             }
 
             Sensor.TYPE_GAME_ROTATION_VECTOR -> {
                 latestGameRotVecHz = gameRotVecRate.update(event.timestamp)
-                val q = FloatArray(4)
-                SensorManager.getQuaternionFromVector(q, event.values)
-                latestGameQuat = q
+                SensorManager.getQuaternionFromVector(latestGameQuat, event.values)
 
-                val r = FloatArray(9)
-                val o = FloatArray(3)
-                SensorManager.getRotationMatrixFromVector(r, event.values)
-                SensorManager.getOrientation(r, o)
-                latestGameYprDeg =
-                    floatArrayOf(
-                        radToDeg(o[0]),
-                        radToDeg(o[1]),
-                        radToDeg(o[2]),
-                    )
+                if (nowMs - lastYprComputeElapsedMs >= 50) {
+                    lastYprComputeElapsedMs = nowMs
+                    SensorManager.getRotationMatrixFromVector(tmpR, event.values)
+                    SensorManager.getOrientation(tmpR, tmpO)
+                    latestGameYprDeg[0] = radToDeg(tmpO[0])
+                    latestGameYprDeg[1] = radToDeg(tmpO[1])
+                    latestGameYprDeg[2] = radToDeg(tmpO[2])
+                }
             }
 
             Sensor.TYPE_ACCELEROMETER -> {
                 latestAccelHz = accelRate.update(event.timestamp)
-                latestAccel = event.values.clone()
+                latestAccel[0] = event.values[0]
+                latestAccel[1] = event.values[1]
+                latestAccel[2] = event.values[2]
             }
 
             Sensor.TYPE_GYROSCOPE -> {
                 latestGyroHz = gyroRate.update(event.timestamp)
-                latestGyro = event.values.clone()
+                latestGyro[0] = event.values[0]
+                latestGyro[1] = event.values[1]
+                latestGyro[2] = event.values[2]
             }
         }
 
-        // Fire raw update on every callback (can be 100-500Hz+).
-        onRawUpdate?.invoke(
-            ImuState(
-                timestampNs = latestTsNs,
-                quat = latestQuat,
-                yprDeg = latestYprDeg,
-                gameQuat = latestGameQuat,
-                gameYprDeg = latestGameYprDeg,
-                accel = latestAccel,
-                gyro = latestGyro,
-                rotVecHz = latestRotVecHz,
-                gameRotVecHz = latestGameRotVecHz,
-                accelHz = latestAccelHz,
-                gyroHz = latestGyroHz,
+        // Fire raw update ONLY on TYPE_GAME_ROTATION_VECTOR updates.
+        if (isGameOrientationUpdate) {
+            onRawUpdate?.invoke(
+                ImuState(
+                    timestampNs = latestTsNs,
+                    quat = latestQuat,
+                    yprDeg = latestYprDeg,
+                    gameQuat = latestGameQuat,
+                    gameYprDeg = latestGameYprDeg,
+                    accel = latestAccel,
+                    gyro = latestGyro,
+                    rotVecHz = latestRotVecHz,
+                    gameRotVecHz = latestGameRotVecHz,
+                    accelHz = latestAccelHz,
+                    gyroHz = latestGyroHz,
+                )
             )
-        )
+        }
 
         // Throttle UI updates to avoid overwhelming Compose with 100s of updates/sec.
-        val nowMs = SystemClock.elapsedRealtime()
         if (nowMs - lastUiEmitElapsedMs < 50) return // ~20 Hz UI updates
         lastUiEmitElapsedMs = nowMs
 
