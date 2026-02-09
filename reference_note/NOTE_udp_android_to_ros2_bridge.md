@@ -34,7 +34,7 @@ Notes:
 ## PC ROS2 bridge (`Ros2_bridge/phonebot_bridge`)
 
 ### What it publishes
-The node `phonebot_udp_bridge` publishes:
+The bridge publishes:
 - `/phonebot/imu` (`sensor_msgs/Imu`) from `rotvec`
 - `/phonebot/imu_game` (`sensor_msgs/Imu`) from `game_rotvec`
 - `/phonebot/battery` (`sensor_msgs/BatteryState`)
@@ -43,14 +43,41 @@ Notes:
 - In ROS `sensor_msgs/Imu`, quaternion is **ROS order** `(x,y,z,w)`; the bridge converts from Android `[w,x,y,z]`.
 - Accel/gyro are reused for both topics.
 
-### Run
-In your ROS2 workspace:
+### Build
+From the workspace root:
 
 ```bash
+cd /media/hrc/T7_UBUNTU_ONLY/android_humanoid_all_files/PhoneBot/Ros2_bridge
 colcon build --packages-select phonebot_bridge
 source install/setup.bash
-ros2 run phonebot_bridge phonebot_udp_bridge --ros-args -p bind_port:=5005
 ```
+
+Tip: if you change Python entry points or want live-edit behavior, use:
+
+```bash
+colcon build --symlink-install --packages-select phonebot_bridge
+```
+
+### Run (two modes)
+
+#### A) Periodic bridge (default 50 Hz publish)
+Receives UDP continuously, but republishes to ROS2 on a fixed timer. This is stable and avoids publishing faster than you want.
+
+```bash
+ros2 run phonebot_bridge phonebot_udp_bridge_periodic --ros-args -p bind_port:=5005 -p publish_hz:=50.0
+```
+
+#### B) Immediate bridge (publish on every UDP packet)
+Publishes as soon as a UDP packet is received/parsed. This lets you see the *actual* incoming UDP rate.
+
+```bash
+ros2 run phonebot_bridge phonebot_udp_bridge_immediate --ros-args -p bind_port:=5005
+```
+
+Optional parameters (both modes):
+- `bind_ip` (default `0.0.0.0`): which interface to listen on
+- `bind_port` (default `5005`)
+- `topic_ns` (default `phonebot`): topics become `/${topic_ns}/imu`, etc.
 
 ### Verify
 ```bash

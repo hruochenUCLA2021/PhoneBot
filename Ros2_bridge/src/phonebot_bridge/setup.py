@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'phonebot_udp_bridge = phonebot_bridge.udp_bridge:main',
+            'phonebot_udp_bridge_periodic = phonebot_bridge.udp_bridge_periodic:main',
+            'phonebot_udp_bridge_immediate = phonebot_bridge.udp_bridge_immediate:main',
         ],
     },
 )
