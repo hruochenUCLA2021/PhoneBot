@@ -7,12 +7,15 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -31,6 +34,9 @@ import com.example.phonebot_app_android.sensors.ImuState
 import com.example.phonebot_app_android.system.BatteryMonitor
 import com.example.phonebot_app_android.ui.theme.PhoneBot_App_AndroidTheme
 import android.view.WindowManager
+import com.example.phonebot_app_android.network.UdpSender
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,6 +53,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class RunMode { LOCAL, REMOTE_UDP }
+
 @Composable
 fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -59,16 +67,46 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val imuMonitor = remember { ImuMonitor(context) }
     var imu by remember { mutableStateOf(ImuState(note = "Starting IMU...")) }
 
+    // UDP streaming
+    var runMode by remember { mutableStateOf(RunMode.LOCAL) }
+    var udpHost by remember { mutableStateOf("192.168.1.2") }
+    var udpPortText by remember { mutableStateOf("5005") }
+    val udpSender = remember { UdpSender() }
+    val remoteEnabled = remember { AtomicBoolean(false) }
+
     DisposableEffect(Unit) {
         batteryMonitor.start()
 
         imuMonitor.onUiUpdate = { imu = it }
+        imuMonitor.onRawUpdate = { sample ->
+            if (remoteEnabled.get()) {
+                val payload =
+                    buildUdpJson(sample, batteryMonitor.state.value)
+                        .toByteArray(StandardCharsets.UTF_8)
+                udpSender.offer(payload)
+            }
+        }
         imuMonitor.startFast()
 
         onDispose {
             batteryMonitor.stop()
             imuMonitor.stop()
+            udpSender.stop()
         }
+    }
+
+    // Apply runMode + target changes
+    DisposableEffect(runMode, udpHost, udpPortText) {
+        val port = udpPortText.toIntOrNull() ?: 0
+        if (runMode == RunMode.REMOTE_UDP && port in 1..65535) {
+            remoteEnabled.set(true)
+            udpSender.setTarget(udpHost, port)
+            udpSender.start()
+        } else {
+            remoteEnabled.set(false)
+            udpSender.stop()
+        }
+        onDispose { /* no-op */ }
     }
 
     Column(
@@ -85,6 +123,46 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            SectionTitle("Mode")
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { runMode = RunMode.LOCAL },
+                    enabled = runMode != RunMode.LOCAL,
+                ) { Text("Local") }
+                Button(
+                    onClick = { runMode = RunMode.REMOTE_UDP },
+                    enabled = runMode != RunMode.REMOTE_UDP,
+                ) { Text("Remote UDP") }
+            }
+
+            if (runMode == RunMode.REMOTE_UDP) {
+                MonoBlock(
+                    lines =
+                        listOf(
+                            "udp target   : ${udpHost}:${udpPortText}",
+                            "udp status   : ${udpSender.lastError?.let { "ERROR: $it" } ?: "OK"}",
+                            "send policy  : latest-only (drops older packets if busy)",
+                        )
+                )
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = udpHost,
+                        onValueChange = { udpHost = it },
+                        label = { Text("PC IP / Host") },
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = udpPortText,
+                        onValueChange = { udpPortText = it.filter { c -> c.isDigit() }.take(5) },
+                        label = { Text("UDP Port") },
+                        singleLine = true,
+                    )
+                }
+            }
+
             SectionTitle("Battery")
             MonoBlock(
                 lines =
@@ -165,3 +243,37 @@ private fun formatHz(name: String, hz: Float?): String {
 }
 
 private fun Float.fmt(): String = "% .4f".format(this)
+
+private fun buildUdpJson(imu: ImuState, battery: com.example.phonebot_app_android.system.BatteryState): String {
+    fun f(x: Float?): String = x?.let { "%.6f".format(it) } ?: "null"
+    fun arr3(a: FloatArray?): String =
+        if (a == null || a.size < 3) "null"
+        else "[${"%.6f".format(a[0])},${"%.6f".format(a[1])},${"%.6f".format(a[2])}]"
+    fun arr4(a: FloatArray?): String =
+        if (a == null || a.size < 4) "null"
+        else "[${"%.6f".format(a[0])},${"%.6f".format(a[1])},${"%.6f".format(a[2])},${"%.6f".format(a[3])}]"
+
+    return buildString {
+        append("{")
+        append("\"ts_ns\":").append(imu.timestampNs).append(',')
+        append("\"accel\":").append(arr3(imu.accel)).append(',')
+        append("\"gyro\":").append(arr3(imu.gyro)).append(',')
+        append("\"rotvec\":{")
+        append("\"hz\":").append(f(imu.rotVecHz)).append(',')
+        append("\"quat\":").append(arr4(imu.quat)).append(',')
+        append("\"ypr_deg\":").append(arr3(imu.yprDeg))
+        append("},")
+        append("\"game_rotvec\":{")
+        append("\"hz\":").append(f(imu.gameRotVecHz)).append(',')
+        append("\"quat\":").append(arr4(imu.gameQuat)).append(',')
+        append("\"ypr_deg\":").append(arr3(imu.gameYprDeg))
+        append("},")
+        append("\"battery\":{")
+        append("\"percent\":").append(battery.percent ?: "null").append(',')
+        append("\"is_charging\":").append(battery.isCharging ?: "null").append(',')
+        append("\"plugged\":").append(if (battery.plugged == null) "null" else "\"${battery.plugged}\"").append(',')
+        append("\"status\":").append(if (battery.status == null) "null" else "\"${battery.status}\"")
+        append("}")
+        append("}")
+    }
+}

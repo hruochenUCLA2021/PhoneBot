@@ -51,6 +51,8 @@ class ImuMonitor(context: Context) : SensorEventListener {
     @Volatile private var lastUiEmitElapsedMs: Long = 0L
 
     var onUiUpdate: ((ImuState) -> Unit)? = null
+    /** Called on every sensor callback (no UI throttling). Intended for streaming/logging. */
+    var onRawUpdate: ((ImuState) -> Unit)? = null
 
     private class RateEstimator(private val alpha: Float = 0.1f) {
         private var lastTsNs: Long = 0L
@@ -174,6 +176,23 @@ class ImuMonitor(context: Context) : SensorEventListener {
                 latestGyro = event.values.clone()
             }
         }
+
+        // Fire raw update on every callback (can be 100-500Hz+).
+        onRawUpdate?.invoke(
+            ImuState(
+                timestampNs = latestTsNs,
+                quat = latestQuat,
+                yprDeg = latestYprDeg,
+                gameQuat = latestGameQuat,
+                gameYprDeg = latestGameYprDeg,
+                accel = latestAccel,
+                gyro = latestGyro,
+                rotVecHz = latestRotVecHz,
+                gameRotVecHz = latestGameRotVecHz,
+                accelHz = latestAccelHz,
+                gyroHz = latestGyroHz,
+            )
+        )
 
         // Throttle UI updates to avoid overwhelming Compose with 100s of updates/sec.
         val nowMs = SystemClock.elapsedRealtime()

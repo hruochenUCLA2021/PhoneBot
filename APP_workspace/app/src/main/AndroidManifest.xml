@@ -4,6 +4,7 @@
 
     <!-- Needed to request SENSOR_DELAY_FASTEST (0us) on newer Android versions -->
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"
