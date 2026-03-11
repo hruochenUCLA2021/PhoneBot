@@ -17,6 +17,12 @@ MAGIC = b"PBOT"
 # v2: sensor packet includes motor present state (pos/vel[13]) and uses flags bit0.
 VERSION_V1 = 1
 VERSION_V2 = 2
+# Current protocol version used for packets we *send*.
+# Must match Android `PhonebotProtocol.VERSION` (currently 2).
+VERSION = VERSION_V2
+# Current protocol version used for packets we *send*.
+# Must match Android `PhonebotProtocol.VERSION` (currently 2).
+VERSION = VERSION_V2
 
 MSG_TYPE_SENSOR = 1
 MSG_TYPE_MOTOR = 2
