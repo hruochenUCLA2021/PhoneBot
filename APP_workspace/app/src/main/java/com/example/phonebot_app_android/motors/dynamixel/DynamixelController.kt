@@ -15,6 +15,10 @@ import com.hoho.android.usbserial.driver.UsbSerialProber
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicBoolean
@@ -32,15 +36,33 @@ import kotlin.math.roundToInt
 class DynamixelController(private val context: Context) {
     data class Config(
         val motorIds: IntArray = IntArray(13) { i -> i + 1 },
-        val baudRate: Int = 1_000_000,
+        val baudRate: Int = 3_000_000,
         val kp: Int = 5, // Position P Gain register units
         // User-friendly value. XL430 Position D Gain is an integer register; we map this float to a register value.
         val kd: Float = 0.1f,
         val initialGoalTicks: Int = 2048,
     )
 
+    private val _logLines = MutableStateFlow<List<String>>(listOf("Motor controller idle."))
+    val logLines: StateFlow<List<String>> = _logLines.asStateFlow()
+
     @Volatile var lastStatus: String = "Motor controller idle."
         private set
+
+    private fun pushStatus(line: String) {
+        lastStatus = line
+        val t = System.currentTimeMillis()
+        _logLines.update { prev ->
+            val next = prev + "${t}ms: $line"
+            if (next.size > 200) next.takeLast(200) else next
+        }
+    }
+
+    private fun devInfo(d: UsbDevice): String {
+        val vid = "0x" + d.vendorId.toString(16)
+        val pid = "0x" + d.productId.toString(16)
+        return "UsbDevice(name=${d.deviceName}, vid=$vid, pid=$pid)"
+    }
 
     private var port: UsbSerialPort? = null
     private var usbPermReceiver: BroadcastReceiver? = null
@@ -79,35 +101,41 @@ class DynamixelController(private val context: Context) {
     suspend fun enable(config: Config = Config()): Boolean = withContext(Dispatchers.IO) {
         if (running.get()) return@withContext true
         running.set(true)
+        var ok = false
         try {
-            lastStatus = "Searching USB serial device..."
+            pushStatus("Searching USB serial device...")
             val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-            val driver = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager).firstOrNull()
+            val drivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
+            pushStatus("USB drivers found: ${drivers.size}")
+            if (drivers.isNotEmpty()) {
+                pushStatus("First device: " + devInfo(drivers.first().device))
+            }
+            val driver = drivers.firstOrNull()
             if (driver == null) {
-                lastStatus = "No USB serial driver found. Plug in adapter (FTDI/CH340/CP210x)."
+                pushStatus("No USB serial driver found. Plug in adapter (FTDI/CH340/CP210x).")
                 return@withContext false
             }
 
             val device = driver.device
             if (!usbManager.hasPermission(device)) {
-                lastStatus = "Requesting USB permission..."
-                val ok = requestUsbPermission(usbManager, device)
-                if (!ok) {
-                    lastStatus = "USB permission denied."
+                pushStatus("Requesting USB permission for ${devInfo(device)} ...")
+                val granted = requestUsbPermission(usbManager, device)
+                if (!granted) {
+                    pushStatus("USB permission denied.")
                     return@withContext false
                 }
             }
 
-            lastStatus = "Opening USB serial port..."
+            pushStatus("Opening USB serial port...")
             val connection = usbManager.openDevice(device)
             if (connection == null) {
-                lastStatus = "openDevice() failed (permission? cable?)."
+                pushStatus("openDevice() failed (permission? cable?).")
                 return@withContext false
             }
 
             val p = driver.ports.firstOrNull()
             if (p == null) {
-                lastStatus = "USB serial has no ports?"
+                pushStatus("USB serial has no ports?")
                 return@withContext false
             }
             p.open(connection)
@@ -117,7 +145,7 @@ class DynamixelController(private val context: Context) {
             p.rts = true
             port = p
 
-            lastStatus = "Configuring ${config.motorIds.size} motors..."
+            pushStatus("Configuring ${config.motorIds.size} motors...")
 
             // 0) Reduce RX traffic: status return level = 1 (return for READ only).
             // We need this for SYNC_READ feedback.
@@ -156,23 +184,31 @@ class DynamixelController(private val context: Context) {
                 write(DynamixelProtocol2.buildWrite1(id, Xl430Registers.ADDR_TORQUE_ENABLE, 1))
             }
 
-            lastStatus = "Motors ON (position mode)."
+            pushStatus("Motors ON (position mode).")
+            ok = true
             true
         } catch (ce: CancellationException) {
+            pushStatus("Enable cancelled.")
             running.set(false)
             throw ce
         } catch (t: Throwable) {
-            lastStatus = "Enable failed: ${t.message ?: t::class.java.simpleName}"
+            pushStatus("Enable failed: ${t::class.java.simpleName}: ${t.message ?: "(no message)"}")
             Log.e("DynamixelController", "enable failed", t)
-            safeClose()
-            running.set(false)
             false
+        } finally {
+            if (!ok) {
+                safeClose()
+                running.set(false)
+                if (lastStatus.isBlank()) {
+                    pushStatus("Enable failed (unknown).")
+                }
+            }
         }
     }
 
     suspend fun disable(config: Config = Config()): Unit = withContext(Dispatchers.IO) {
         try {
-            lastStatus = "Motors OFF (torque disable)..."
+            pushStatus("Motors OFF (torque disable)...")
             val ids = config.motorIds
             for (id in ids) {
                 runCatching { write(DynamixelProtocol2.buildWrite1(id, Xl430Registers.ADDR_TORQUE_ENABLE, 0)) }
@@ -180,7 +216,7 @@ class DynamixelController(private val context: Context) {
         } finally {
             safeClose()
             running.set(false)
-            lastStatus = "Motor controller idle."
+            pushStatus("Motor controller idle.")
         }
     }
 
@@ -395,10 +431,14 @@ class DynamixelController(private val context: Context) {
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
 
+        // Android 14+ (targetSdk 34+) forbids creating a *mutable* PendingIntent with an implicit Intent.
+        // For USB permission requests we don't need mutability, so use an *immutable* PendingIntent and
+        // make the intent package-explicit.
         val flags =
-            if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-            else PendingIntent.FLAG_UPDATE_CURRENT
-        val pi = PendingIntent.getBroadcast(context, 0, Intent(action), flags)
+            PendingIntent.FLAG_UPDATE_CURRENT or
+                (if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0)
+        val permIntent = Intent(action).setPackage(context.packageName)
+        val pi = PendingIntent.getBroadcast(context, 0, permIntent, flags)
         usbManager.requestPermission(device, pi)
 
         // Busy-wait up to ~2s. (Simple for now; can be upgraded to suspend/await.)

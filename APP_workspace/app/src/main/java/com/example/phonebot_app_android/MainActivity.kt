@@ -115,6 +115,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     var motorHwEnabled by remember { mutableStateOf(false) }
     var motorHwStatus by remember { mutableStateOf("Motor HW: OFF") }
     val dxlConfig = remember { DynamixelController.Config() } // default: ids 1..13, baud 1M, kp=5, kd=0.1
+    val dxlLogLines by dxlController.logLines.collectAsState()
     var motorFbUi by remember { mutableStateOf(MotorFeedbackUiState(note = "Motor feedback: not started")) }
     val latestMotorFbRef =
         remember { AtomicReference<DynamixelController.MotorStatus?>(null) }
@@ -372,12 +373,17 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                         "status       : $motorHwStatus",
                         "dxl note     : ${dxlController.lastStatus}",
                         "ids          : 1..13 (default)",
-                        "baud         : 1,000,000",
+                        "baud         : ${dxlConfig.baudRate}",
                         "mode         : position",
                         "kp / kd      : 5 / 0.1 (kd maps to integer register)",
                         "init goal    : 0 rad (~2048 ticks)",
                         "cmd source   : UDP pos[13] (rad) @ 100Hz loop",
                     ),
+            )
+            MonoBlock(
+                lines =
+                    listOf("dxl log (latest)") +
+                        dxlLogLines.takeLast(12).map { "  $it" },
             )
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
