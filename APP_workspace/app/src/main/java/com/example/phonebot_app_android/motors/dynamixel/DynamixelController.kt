@@ -13,7 +13,17 @@ import androidx.core.content.ContextCompat
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,7 +31,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.asCoroutineDispatcher
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.roundToInt
 
@@ -31,20 +44,40 @@ import kotlin.math.roundToInt
  * Notes / assumptions:
  * - Motor IDs default to 1..13 (change in code if needed).
  * - Incoming UDP motor positions are interpreted as radians in [-pi, +pi].
- * - Radians are mapped to raw position ticks [0..4095] with 0 rad ~= 2048.
+ * - In Extended Position Control Mode: ticks are signed, 4096 ticks/rev, and 0 rad ~= 0 ticks.
  */
 class DynamixelController(private val context: Context) {
     data class Config(
         val motorIds: IntArray = IntArray(13) { i -> i + 1 },
-        val baudRate: Int = 3_000_000,
+        val baudRate: Int = 1_000_000,
         val kp: Int = 5, // Position P Gain register units
         // User-friendly value. XL430 Position D Gain is an integer register; we map this float to a register value.
         val kd: Float = 0.1f,
-        val initialGoalTicks: Int = 2048,
+        // Kept for backwards compatibility; not used in the current enable() sequence (we set goal = present position).
+        val initialGoalTicks: Int = 0,
     )
 
     private val _logLines = MutableStateFlow<List<String>>(listOf("Motor controller idle."))
     val logLines: StateFlow<List<String>> = _logLines.asStateFlow()
+
+    data class MotorDiag(
+        val id: Int,
+        val connected: Boolean,
+        val torqueEnabled: Boolean? = null,
+        val operatingMode: Int? = null,
+        val hwError: Int? = null,
+        val inputVoltage01V: Int? = null,
+        val temperatureC: Int? = null,
+        val lastSeenMs: Long? = null,
+    )
+
+    private val _motorDiag = MutableStateFlow<List<MotorDiag>>(emptyList())
+    val motorDiag: StateFlow<List<MotorDiag>> = _motorDiag.asStateFlow()
+
+    private val _motorFeedback = MutableStateFlow<MotorStatus?>(null)
+    val motorFeedback: StateFlow<MotorStatus?> = _motorFeedback.asStateFlow()
+
+    private val lastSeenById = HashMap<Int, Long>()
 
     @Volatile var lastStatus: String = "Motor controller idle."
         private set
@@ -69,6 +102,30 @@ class DynamixelController(private val context: Context) {
 
     private val running = AtomicBoolean(false)
     private val ioMutex = Mutex()
+
+    private sealed class UsbCmd {
+        data class Torque(val enable: Boolean) : UsbCmd()
+    }
+
+    enum class DiagMode { SYNC_READ, PER_ID_TXRX }
+
+    private val _usbThreadRunning = MutableStateFlow(false)
+    val usbThreadRunning: StateFlow<Boolean> = _usbThreadRunning.asStateFlow()
+
+    @Volatile private var usbDiagMode: DiagMode = DiagMode.PER_ID_TXRX
+    @Volatile private var usbTrackPcGoals: Boolean = false
+    private val latestPcGoalRad = AtomicReference<FloatArray?>(null)
+
+    private val usbCmdQ = Channel<UsbCmd>(capacity = Channel.BUFFERED)
+    private var usbExecutor: java.util.concurrent.ExecutorService? = null
+    private var usbDispatcher: ExecutorCoroutineDispatcher? = null
+    private var usbScope: CoroutineScope? = null
+    private var usbJob: Job? = null
+
+    // Hold-last-value caches so missing replies don't snap to 0.
+    // Size matches `config.motorIds.size` (typically 13).
+    private var lastPosRadCache: FloatArray? = null
+    private var lastVelRadSCache: FloatArray? = null
 
     data class MotorStatus(
         val rxHz: Float? = null,
@@ -97,6 +154,253 @@ class DynamixelController(private val context: Context) {
     private val rxBuf = ByteArray(4096)
     private var rxLen = 0
     private val tmpRead = ByteArray(512)
+
+    // DynamixelSDK-style comm result codes (subset; used for logging/diagnostics).
+    private companion object {
+        private const val COMM_SUCCESS = 0
+        private const val COMM_TX_FAIL = -1001
+        private const val COMM_RX_TIMEOUT = -3001
+    }
+
+    private fun commResultToString(code: Int): String =
+        when (code) {
+            COMM_SUCCESS -> "COMM_SUCCESS"
+            COMM_TX_FAIL -> "COMM_TX_FAIL"
+            COMM_RX_TIMEOUT -> "COMM_RX_TIMEOUT"
+            else -> "COMM_$code"
+        }
+
+    private fun dxlErrorToString(err: Int): String = "0x" + (err and 0xFF).toString(16).padStart(2, '0')
+
+    fun setLatestPcGoals(posRad: FloatArray?) {
+        latestPcGoalRad.set(posRad)
+    }
+
+    fun setUsbDiagMode(mode: DiagMode) {
+        usbDiagMode = mode
+    }
+
+    fun setUsbTrackPcGoals(enabled: Boolean) {
+        usbTrackPcGoals = enabled
+    }
+
+    fun enqueueTorque(enable: Boolean) {
+        usbCmdQ.trySend(UsbCmd.Torque(enable))
+    }
+
+    suspend fun startUsbThread(config: Config = Config()) {
+        if (_usbThreadRunning.value) return
+
+        val exec = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "dxl-usb-worker").apply { isDaemon = true }
+        }
+        val disp = exec.asCoroutineDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + disp)
+
+        usbExecutor = exec
+        usbDispatcher = disp
+        usbScope = scope
+
+        _usbThreadRunning.value = true
+        pushStatus("USB thread: START")
+
+        usbJob =
+            scope.launch {
+                var nextDiagMs = 0L
+                var nextGoalMs = 0L
+                var nextFbMs = 0L
+                while (isActive) {
+                    // Execute queued commands (enable/disable)
+                    while (true) {
+                        val cmd = usbCmdQ.tryReceive().getOrNull() ?: break
+                        when (cmd) {
+                            is UsbCmd.Torque -> {
+                                val ok = torqueTxRxLocked(config, enable = cmd.enable, perIdTimeoutMs = 200)
+                                pushStatus("USB thread: torque ${if (cmd.enable) "ON" else "OFF"} done (ok=$ok)")
+                            }
+                        }
+                    }
+
+                    val now = System.currentTimeMillis()
+
+                    // Periodic diagnostics (2 Hz)
+                    if (now >= nextDiagMs) {
+                        runCatching {
+                            val usePerId = (usbDiagMode == DiagMode.PER_ID_TXRX)
+                            updateMotorDiagLockedWorker(config, usePerIdTxRx = usePerId, perReadTimeoutMs = 200)
+                        }.onFailure { t ->
+                            pushStatus("USB thread: diag failed: ${t::class.java.simpleName}: ${t.message ?: "(no message)"}")
+                        }
+                        nextDiagMs = now + 500L
+                    }
+
+                    // Periodic motor feedback for PC (present pos/vel)
+                    if (now >= nextFbMs) {
+                        runCatching { _motorFeedback.value = readPresentPosVelLockedWorker(config) }
+                        nextFbMs = now + 50L // 20 Hz
+                    }
+
+                    // Track PC goals (latest-only), if enabled
+                    if (usbTrackPcGoals && now >= nextGoalMs) {
+                        val goals = latestPcGoalRad.get()
+                        if (goals != null) {
+                            runCatching { sendGoalPositionsRadLocked(config, goals) }
+                        }
+                        nextGoalMs = now + 10L // 100 Hz
+                    }
+
+                    delay(2)
+                }
+            }
+    }
+
+    suspend fun stopUsbThread() {
+        if (!_usbThreadRunning.value) return
+        _usbThreadRunning.value = false
+        pushStatus("USB thread: STOP requested")
+
+        val job = usbJob
+        val scope = usbScope
+        usbJob = null
+        usbScope = null
+
+        if (job != null) {
+            runCatching { job.cancelAndJoin() }
+        }
+        scope?.cancel()
+
+        ioMutex.withLock {
+            safeClose()
+            running.set(false)
+        }
+
+        runCatching { usbDispatcher?.close() }
+        usbDispatcher = null
+
+        usbExecutor?.let { runCatching { it.shutdownNow() } }
+        usbExecutor = null
+
+        pushStatus("USB thread: STOPPED")
+    }
+
+    private fun ensurePortOpenLocked(config: Config): Boolean {
+        if (port != null) return true
+
+        pushStatus("Searching USB serial device...")
+        val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+        val drivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
+        pushStatus("USB drivers found: ${drivers.size}")
+        if (drivers.isNotEmpty()) {
+            pushStatus("First device: " + devInfo(drivers.first().device))
+        }
+        val driver = drivers.firstOrNull()
+        if (driver == null) {
+            pushStatus("No USB serial driver found. Plug in adapter (FTDI/CH340/CP210x).")
+            return false
+        }
+
+        val device = driver.device
+        if (!usbManager.hasPermission(device)) {
+            pushStatus("Requesting USB permission for ${devInfo(device)} ...")
+            val granted = requestUsbPermission(usbManager, device)
+            if (!granted) {
+                pushStatus("USB permission denied.")
+                return false
+            }
+        }
+
+        pushStatus("Opening USB serial port...")
+        val connection = usbManager.openDevice(device)
+        if (connection == null) {
+            pushStatus("openDevice() failed (permission? cable?).")
+            return false
+        }
+
+        val p = driver.ports.firstOrNull()
+        if (p == null) {
+            pushStatus("USB serial has no ports?")
+            return false
+        }
+        p.open(connection)
+        p.setParameters(config.baudRate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+        // Low latency for control
+        p.dtr = true
+        p.rts = true
+        port = p
+        running.set(true)
+        return true
+    }
+
+    /**
+     * Minimal torque command for debugging:
+     * - Opens USB serial (if needed)
+     * - Sends Torque Enable/Disable using TxRx-style (WRITE then wait Status Packet)
+     * - Prints per-ID comm result + dxl_error to the on-screen log
+     * - Keeps port open so diag polling can run
+     */
+    suspend fun torqueTxRxOnce(config: Config = Config(), enable: Boolean, perIdTimeoutMs: Int = 200): Boolean =
+        withContext(Dispatchers.IO) {
+            ioMutex.withLock {
+                var ok = false
+                try {
+                    if (!ensurePortOpenLocked(config)) return@withLock false
+
+                    val ids = config.motorIds
+                    val target = if (enable) 1 else 0
+                    pushStatus("Torque TxRx ONCE: ${if (enable) "ON" else "OFF"} ids=${ids.joinToString(",")}")
+
+                    var okAll = true
+                    for (id in ids) {
+                        val (comm, dxlErr) =
+                            write1ByteTxRx(
+                                id = id,
+                                addr = Xl430Registers.ADDR_TORQUE_ENABLE,
+                                value = target,
+                                timeoutMs = perIdTimeoutMs,
+                            )
+                        val okId = (comm == COMM_SUCCESS && dxlErr == 0)
+                        okAll = okAll && okId
+                        pushStatus("  id=$id comm=${commResultToString(comm)} err=${dxlErrorToString(dxlErr)}")
+                    }
+
+                    // Read-back snapshot so you can see actual state even if WRITE status didn't return.
+                    runCatching { updateMotorDiagLockedSyncRead(config) }
+
+                    ok = okAll
+                    okAll
+                } catch (t: Throwable) {
+                    pushStatus("Torque TxRx failed: ${t::class.java.simpleName}: ${t.message ?: "(no message)"}")
+                    false
+                } finally {
+                    // Keep the port open so diag polling can continue.
+                    pushStatus("Torque TxRx once done.")
+                    if (!ok) {
+                        // keep status line already printed
+                    }
+                }
+            }
+        }
+
+    private fun torqueTxRxLocked(config: Config, enable: Boolean, perIdTimeoutMs: Int): Boolean {
+        if (!ensurePortOpenLocked(config)) return false
+        val ids = config.motorIds
+        val target = if (enable) 1 else 0
+        pushStatus("Torque TxRx: ${if (enable) "ON" else "OFF"} ids=${ids.joinToString(",")}")
+        var okAll = true
+        for (id in ids) {
+            val (comm, dxlErr) =
+                write1ByteTxRx(
+                    id = id,
+                    addr = Xl430Registers.ADDR_TORQUE_ENABLE,
+                    value = target,
+                    timeoutMs = perIdTimeoutMs,
+                )
+            val okId = (comm == COMM_SUCCESS && dxlErr == 0)
+            okAll = okAll && okId
+            pushStatus("  id=$id comm=${commResultToString(comm)} err=${dxlErrorToString(dxlErr)}")
+        }
+        return okAll
+    }
 
     suspend fun enable(config: Config = Config()): Boolean = withContext(Dispatchers.IO) {
         if (running.get()) return@withContext true
@@ -145,46 +449,19 @@ class DynamixelController(private val context: Context) {
             p.rts = true
             port = p
 
-            pushStatus("Configuring ${config.motorIds.size} motors...")
+            pushStatus("Torque-only enable (no mode/PID/goal writes).")
 
-            // 0) Reduce RX traffic: status return level = 1 (return for READ only).
-            // We need this for SYNC_READ feedback.
-            for (id in config.motorIds) {
-                write(DynamixelProtocol2.buildWrite1(id, Xl430Registers.ADDR_STATUS_RETURN_LEVEL, 1))
+            // Torque ON with verification + retry.
+            // NOTE: Read-back requires motors to return status for READ (Status Return Level = 1 or 2).
+            if (!setTorqueWithRetry(config, enable = true, tries = 3)) {
+                pushStatus("Torque ON failed after retries.")
+                return@withContext false
             }
 
-            // 1) Torque OFF before changing operating mode and gains.
-            for (id in config.motorIds) {
-                write(DynamixelProtocol2.buildWrite1(id, Xl430Registers.ADDR_TORQUE_ENABLE, 0))
-            }
+            // Update diag right after enable (read-only)
+            runCatching { updateMotorDiagLockedSyncRead(config) }
 
-            // 2) Position mode
-            for (id in config.motorIds) {
-                write(
-                    DynamixelProtocol2.buildWrite1(
-                        id,
-                        Xl430Registers.ADDR_OPERATING_MODE,
-                        Xl430Registers.MODE_POSITION_CONTROL,
-                    )
-                )
-            }
-
-            // 3) PID gains (register units)
-            val kdReg = kdToReg(config.kd)
-            for (id in config.motorIds) {
-                write(DynamixelProtocol2.buildWrite2(id, Xl430Registers.ADDR_POSITION_P_GAIN, config.kp))
-                write(DynamixelProtocol2.buildWrite2(id, Xl430Registers.ADDR_POSITION_D_GAIN, kdReg))
-            }
-
-            // 4) Goal position = 0 rad (2048 ticks)
-            sendGoalTicksSync(config.motorIds, IntArray(config.motorIds.size) { config.initialGoalTicks })
-
-            // 5) Torque ON
-            for (id in config.motorIds) {
-                write(DynamixelProtocol2.buildWrite1(id, Xl430Registers.ADDR_TORQUE_ENABLE, 1))
-            }
-
-            pushStatus("Motors ON (position mode).")
+            pushStatus("Motors torque ON (verified).")
             ok = true
             true
         } catch (ce: CancellationException) {
@@ -209,28 +486,76 @@ class DynamixelController(private val context: Context) {
     suspend fun disable(config: Config = Config()): Unit = withContext(Dispatchers.IO) {
         try {
             pushStatus("Motors OFF (torque disable)...")
-            val ids = config.motorIds
-            for (id in ids) {
-                runCatching { write(DynamixelProtocol2.buildWrite1(id, Xl430Registers.ADDR_TORQUE_ENABLE, 0)) }
-            }
+            runCatching { setTorqueWithRetry(config, enable = false, tries = 3) }
         } finally {
             safeClose()
             running.set(false)
             pushStatus("Motor controller idle.")
+            // Keep last motor status snapshot for debugging even after disable/failure.
         }
     }
 
     suspend fun sendGoalPositionsRad(config: Config, posRad: FloatArray) = withContext(Dispatchers.IO) {
         if (!running.get()) return@withContext
         ioMutex.withLock {
-            val ids = config.motorIds
-            val n = minOf(ids.size, posRad.size)
-            val ticks = IntArray(n)
-            for (i in 0 until n) {
-                ticks[i] = radToTicks(posRad[i])
-            }
-            sendGoalTicksSync(ids.copyOfRange(0, n), ticks)
+            sendGoalPositionsRadLocked(config, posRad)
         }
+    }
+
+    private fun sendGoalPositionsRadLocked(config: Config, posRad: FloatArray) {
+        if (!ensurePortOpenLocked(config)) return
+        val ids = config.motorIds
+        val n = minOf(ids.size, posRad.size)
+        val ticks = IntArray(n)
+        for (i in 0 until n) {
+            ticks[i] = radToTicksExtended(posRad[i])
+        }
+        sendGoalTicksSync(ids.copyOfRange(0, n), ticks)
+    }
+
+    private fun readPresentPosVelLockedWorker(config: Config): MotorStatus {
+        if (!ensurePortOpenLocked(config)) return MotorStatus()
+        val ids = config.motorIds
+        val pkt = DynamixelProtocol2.buildSyncRead(Xl430Registers.ADDR_PRESENT_VELOCITY, 8, ids)
+        write(pkt)
+
+        if (lastPosRadCache == null || lastPosRadCache?.size != ids.size) {
+            lastPosRadCache = FloatArray(ids.size) { 0f }
+            lastVelRadSCache = FloatArray(ids.size) { 0f }
+        }
+        val vel = lastVelRadSCache!!.copyOf()
+        val pos = lastPosRadCache!!.copyOf()
+
+        var got = 0
+        val deadline = System.currentTimeMillis() + 50L
+        while (got < ids.size && System.currentTimeMillis() < deadline) {
+            val st = readOneStatusPacket(timeoutMs = 10) ?: continue
+            val id = st.id
+            var idx = -1
+            for (i in ids.indices) {
+                if (ids[i] == id) {
+                    idx = i
+                    break
+                }
+            }
+            if (idx < 0) continue
+            if (st.params.size < 1 + 8) continue
+            val vRaw = leInt32(st.params, 1)
+            val pRaw = leInt32(st.params, 5)
+            vel[idx] = vRaw.toFloat() * 0.0239691227f
+            pos[idx] = ticksToRadExtended(pRaw)
+            got += 1
+            lastSeenById[id] = System.currentTimeMillis()
+        }
+
+        lastPosRadCache = pos
+        lastVelRadSCache = vel
+
+        return MotorStatus(
+            rxHz = statusRate.update(System.nanoTime()),
+            posRad = pos,
+            velRadS = vel,
+        )
     }
 
     suspend fun readPresentPosVel(config: Config): MotorStatus = withContext(Dispatchers.IO) {
@@ -241,8 +566,12 @@ class DynamixelController(private val context: Context) {
             val pkt = DynamixelProtocol2.buildSyncRead(Xl430Registers.ADDR_PRESENT_VELOCITY, 8, ids)
             write(pkt)
 
-            val vel = FloatArray(ids.size)
-            val pos = FloatArray(ids.size)
+            if (lastPosRadCache == null || lastPosRadCache?.size != ids.size) {
+                lastPosRadCache = FloatArray(ids.size) { 0f }
+                lastVelRadSCache = FloatArray(ids.size) { 0f }
+            }
+            val vel = lastVelRadSCache!!.copyOf()
+            val pos = lastPosRadCache!!.copyOf()
 
             var got = 0
             val deadline = System.currentTimeMillis() + 50L // ~50ms budget
@@ -262,9 +591,32 @@ class DynamixelController(private val context: Context) {
                 val vRaw = leInt32(st.params, 1)
                 val pRaw = leInt32(st.params, 5)
                 vel[idx] = vRaw.toFloat() * 0.0239691227f
-                pos[idx] = ticksToRad(pRaw)
+                pos[idx] = ticksToRadExtended(pRaw)
                 got += 1
+
+                // connectivity timestamp
+                lastSeenById[id] = System.currentTimeMillis()
             }
+
+            // Opportunistically refresh the "connected" field in the diag without extra reads.
+            // (Torque/mode/error require register reads; we update those elsewhere.)
+            val now = System.currentTimeMillis()
+            val existing = _motorDiag.value
+            if (existing.isNotEmpty()) {
+                _motorDiag.update { prev ->
+                    prev.map { d ->
+                        val seen = lastSeenById[d.id]
+                        d.copy(
+                            connected = seen != null && (now - seen) <= 1000L,
+                            lastSeenMs = seen,
+                        )
+                    }
+                }
+            }
+
+            // Update caches (hold-last-value behavior)
+            lastPosRadCache = pos
+            lastVelRadSCache = vel
 
             MotorStatus(
                 rxHz = statusRate.update(System.nanoTime()),
@@ -274,14 +626,210 @@ class DynamixelController(private val context: Context) {
         }
     }
 
-    private fun radToTicks(rad: Float): Int {
-        // XL430 model file states:
-        //   min_rad=-pi -> 0
-        //   0 rad -> 2048
-        //   +pi -> 4095
-        val clamped = rad.coerceIn((-PI).toFloat(), PI.toFloat())
-        val ticks = 2048f + (clamped * (2048f / PI.toFloat()))
-        return ticks.roundToInt().coerceIn(0, 4095)
+    private fun syncRead(
+        startAddr: Int,
+        dataLen: Int,
+        ids: IntArray,
+        perPacketTimeoutMs: Int = 10,
+        totalBudgetMs: Int = 80,
+    ): Map<Int, ByteArray> {
+        val pkt = DynamixelProtocol2.buildSyncRead(startAddr, dataLen, ids)
+        write(pkt)
+        val out = HashMap<Int, ByteArray>()
+        val deadline = System.currentTimeMillis() + totalBudgetMs
+        while (System.currentTimeMillis() < deadline && out.size < ids.size) {
+            val st = readOneStatusPacket(timeoutMs = perPacketTimeoutMs) ?: continue
+            if (st.params.isEmpty()) continue
+            // params[0] = error, then dataLen bytes
+            if (st.params.size < 1 + dataLen) continue
+            val data = st.params.copyOfRange(1, 1 + dataLen)
+            out[st.id] = data
+            lastSeenById[st.id] = System.currentTimeMillis()
+        }
+        return out
+    }
+
+    private fun updateMotorDiagLockedSyncRead(config: Config) {
+            val ids = config.motorIds
+            val now = System.currentTimeMillis()
+
+            val mode = syncRead(Xl430Registers.ADDR_OPERATING_MODE, 1, ids)
+            val torque = syncRead(Xl430Registers.ADDR_TORQUE_ENABLE, 1, ids)
+            val hwerr = syncRead(Xl430Registers.ADDR_HARDWARE_ERROR_STATUS, 1, ids)
+            val vin = syncRead(Xl430Registers.ADDR_PRESENT_INPUT_VOLTAGE, 2, ids)
+            val temp = syncRead(Xl430Registers.ADDR_PRESENT_TEMPERATURE, 1, ids)
+
+            val diags =
+                ids.map { id ->
+                    val seen = lastSeenById[id]
+                    val connected = seen != null && (now - seen) <= 1500L
+                    val torqueVal = torque[id]?.get(0)?.toInt()?.and(0xFF)
+                    val modeVal = mode[id]?.get(0)?.toInt()?.and(0xFF)
+                    val hwVal = hwerr[id]?.get(0)?.toInt()?.and(0xFF)
+                    val tempVal = temp[id]?.get(0)?.toInt()?.and(0xFF)
+                    val vinBytes = vin[id]
+                    val vinVal =
+                        if (vinBytes != null && vinBytes.size >= 2)
+                            (vinBytes[0].toInt() and 0xFF) or ((vinBytes[1].toInt() and 0xFF) shl 8)
+                        else null
+
+                    MotorDiag(
+                        id = id,
+                        connected = connected,
+                        torqueEnabled = torqueVal?.let { it != 0 },
+                        operatingMode = modeVal,
+                        hwError = hwVal,
+                        inputVoltage01V = vinVal,
+                        temperatureC = tempVal,
+                        lastSeenMs = seen,
+                    )
+                }
+            _motorDiag.value = diags
+    }
+
+    private fun updateMotorDiagLockedPerIdTxRx(config: Config, perReadTimeoutMs: Int) {
+        val ids = config.motorIds
+        val now = System.currentTimeMillis()
+
+        val diags =
+            ids.map { id ->
+                val (modeData, modeComm, modeErr) =
+                    readTxRx(id, Xl430Registers.ADDR_OPERATING_MODE, 1, timeoutMs = perReadTimeoutMs)
+                val (tqData, tqComm, tqErr) =
+                    readTxRx(id, Xl430Registers.ADDR_TORQUE_ENABLE, 1, timeoutMs = perReadTimeoutMs)
+                val (hwData, hwComm, hwErr) =
+                    readTxRx(id, Xl430Registers.ADDR_HARDWARE_ERROR_STATUS, 1, timeoutMs = perReadTimeoutMs)
+                val (vinData, vinComm, vinErr) =
+                    readTxRx(id, Xl430Registers.ADDR_PRESENT_INPUT_VOLTAGE, 2, timeoutMs = perReadTimeoutMs)
+                val (tempData, tempComm, tempErr) =
+                    readTxRx(id, Xl430Registers.ADDR_PRESENT_TEMPERATURE, 1, timeoutMs = perReadTimeoutMs)
+
+                // If any read had non-zero comm/error, print a compact line (debugging only).
+                if (modeComm != COMM_SUCCESS || modeErr != 0 ||
+                    tqComm != COMM_SUCCESS || tqErr != 0 ||
+                    hwComm != COMM_SUCCESS || hwErr != 0 ||
+                    vinComm != COMM_SUCCESS || vinErr != 0 ||
+                    tempComm != COMM_SUCCESS || tempErr != 0
+                ) {
+                    pushStatus(
+                        "Diag TxRx id=$id: " +
+                            "mode(${commResultToString(modeComm)},${dxlErrorToString(modeErr)}) " +
+                            "tq(${commResultToString(tqComm)},${dxlErrorToString(tqErr)}) " +
+                            "hw(${commResultToString(hwComm)},${dxlErrorToString(hwErr)}) " +
+                            "vin(${commResultToString(vinComm)},${dxlErrorToString(vinErr)}) " +
+                            "temp(${commResultToString(tempComm)},${dxlErrorToString(tempErr)})",
+                    )
+                }
+
+                val seen = lastSeenById[id]
+                val connected = seen != null && (now - seen) <= 1500L
+
+                val modeVal = modeData?.getOrNull(0)?.toInt()?.and(0xFF)
+                val torqueVal = tqData?.getOrNull(0)?.toInt()?.and(0xFF)
+                val hwVal = hwData?.getOrNull(0)?.toInt()?.and(0xFF)
+                val tempVal = tempData?.getOrNull(0)?.toInt()?.and(0xFF)
+                val vinVal =
+                    if (vinData != null && vinData.size >= 2)
+                        (vinData[0].toInt() and 0xFF) or ((vinData[1].toInt() and 0xFF) shl 8)
+                    else null
+
+                MotorDiag(
+                    id = id,
+                    connected = connected,
+                    torqueEnabled = torqueVal?.let { it != 0 },
+                    operatingMode = modeVal,
+                    hwError = hwVal,
+                    inputVoltage01V = vinVal,
+                    temperatureC = tempVal,
+                    lastSeenMs = seen,
+                )
+            }
+        _motorDiag.value = diags
+    }
+
+    private fun updateMotorDiagLockedWorker(
+        config: Config,
+        usePerIdTxRx: Boolean,
+        perReadTimeoutMs: Int,
+    ) {
+        if (!ensurePortOpenLocked(config)) return
+        if (usePerIdTxRx) {
+            updateMotorDiagLockedPerIdTxRx(config, perReadTimeoutMs = perReadTimeoutMs)
+        } else {
+            updateMotorDiagLockedSyncRead(config)
+        }
+    }
+
+    suspend fun updateMotorDiag(
+        config: Config,
+        usePerIdTxRx: Boolean = false,
+        perReadTimeoutMs: Int = 200,
+    ): Unit = withContext(Dispatchers.IO) {
+        ioMutex.withLock {
+            if (!ensurePortOpenLocked(config)) return@withLock
+            if (usePerIdTxRx) {
+                updateMotorDiagLockedPerIdTxRx(config, perReadTimeoutMs = perReadTimeoutMs)
+            } else {
+                updateMotorDiagLockedSyncRead(config)
+            }
+        }
+    }
+
+    private fun setTorqueWithRetry(config: Config, enable: Boolean, tries: Int): Boolean {
+        val ids = config.motorIds
+        val target = if (enable) 1 else 0
+
+        for (attempt in 1..tries) {
+            pushStatus("Torque ${if (enable) "ON" else "OFF"} attempt $attempt/$tries ...")
+
+            // TxRx-style torque write (like DynamixelSDK write1ByteTxRx): write then wait for Status Packet.
+            // If a motor doesn't return Status Packets for WRITE (e.g., Status Return Level = 1),
+            // this will timeout but the write may still have applied. We therefore still do a read-back verify below.
+            var commOk = 0
+            var commTimeout = 0
+            var dxlErrNonzero = 0
+            for (id in ids) {
+                val (comm, dxlErr) = write1ByteTxRx(
+                    id = id,
+                    addr = Xl430Registers.ADDR_TORQUE_ENABLE,
+                    value = target,
+                    timeoutMs = 200,
+                )
+                if (comm == COMM_SUCCESS) commOk++ else if (comm == COMM_RX_TIMEOUT) commTimeout++
+                if (dxlErr != 0) dxlErrNonzero++
+                if (comm != COMM_SUCCESS || dxlErr != 0) {
+                    pushStatus("Torque TxRx id=$id: comm=${commResultToString(comm)} err=${dxlErrorToString(dxlErr)}")
+                }
+            }
+            try {
+                Thread.sleep(30)
+            } catch (_: InterruptedException) {
+            }
+
+            val vals = syncRead(Xl430Registers.ADDR_TORQUE_ENABLE, 1, ids, perPacketTimeoutMs = 10, totalBudgetMs = 120)
+            val okCount = ids.count { id ->
+                val b = vals[id]?.get(0)?.toInt()?.and(0xFF)
+                b != null && b == target
+            }
+            val seenCount = vals.size
+            pushStatus(
+                "Torque TxRx: ok=$commOk/${ids.size}, timeout=$commTimeout/${ids.size}, dxlErrNonzero=$dxlErrNonzero | readback ok=$okCount/${ids.size}, responded=$seenCount/${ids.size}",
+            )
+
+            // Update diag each attempt so UI shows which IDs are missing / wrong.
+            runCatching { updateMotorDiagLockedSyncRead(config) }
+
+            if (okCount == ids.size) return true
+        }
+        return false
+    }
+
+    private fun radToTicksExtended(rad: Float): Int {
+        // Extended position mode: int32 ticks, 4096 ticks per revolution.
+        // ticks = rad * (4096 / (2*pi)) = rad * (2048 / pi)
+        val ticks = rad * (2048f / PI.toFloat())
+        // XL430 supports +/-256 rev in extended position mode (from eManual): +/-1,048,575
+        return ticks.roundToInt().coerceIn(-1_048_575, 1_048_575)
     }
 
     private fun sendGoalTicksSync(ids: IntArray, ticks: IntArray) {
@@ -302,11 +850,78 @@ class DynamixelController(private val context: Context) {
 
     private fun write(packet: ByteArray) {
         val p = port ?: error("USB serial not open")
-        // Note: we don't read status packets; we try to reduce them via STATUS_RETURN_LEVEL=0.
+        // We may read Status Packets (TxRx torque + syncRead) and parse them via readOneStatusPacket().
         p.write(packet, 50)
     }
 
     private data class StatusPacket(val id: Int, val params: ByteArray)
+
+    private fun flushRx(maxMs: Int = 20) {
+        rxLen = 0
+        val p = port ?: return
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < maxMs) {
+            val n = try {
+                p.read(tmpRead, 1)
+            } catch (_: Throwable) {
+                return
+            }
+            if (n <= 0) return
+        }
+    }
+
+    private fun readTxRx(
+        id: Int,
+        addr: Int,
+        dataLen: Int,
+        timeoutMs: Int,
+    ): Triple<ByteArray?, Int, Int> {
+        flushRx(maxMs = 10)
+        val pkt = DynamixelProtocol2.buildRead(id, addr, dataLen)
+        try {
+            write(pkt)
+        } catch (_: Throwable) {
+            return Triple(null, COMM_TX_FAIL, 0)
+        }
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val remain = (deadline - System.currentTimeMillis()).toInt().coerceAtLeast(1)
+            val st = readOneStatusPacket(timeoutMs = minOf(10, remain)) ?: continue
+            if (st.id != id) continue
+            val dxlErr = st.params.firstOrNull()?.toInt()?.and(0xFF) ?: 0
+            if (st.params.size < 1 + dataLen) return Triple(null, COMM_SUCCESS, dxlErr)
+            val data = st.params.copyOfRange(1, 1 + dataLen)
+            lastSeenById[id] = System.currentTimeMillis()
+            return Triple(data, COMM_SUCCESS, dxlErr)
+        }
+        return Triple(null, COMM_RX_TIMEOUT, 0)
+    }
+
+    private fun write1ByteTxRx(
+        id: Int,
+        addr: Int,
+        value: Int,
+        timeoutMs: Int,
+    ): Pair<Int, Int> {
+        flushRx(maxMs = 10)
+        val pkt = DynamixelProtocol2.buildWrite1(id, addr, value)
+        try {
+            write(pkt)
+        } catch (_: Throwable) {
+            return COMM_TX_FAIL to 0
+        }
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val remain = (deadline - System.currentTimeMillis()).toInt().coerceAtLeast(1)
+            val st = readOneStatusPacket(timeoutMs = minOf(10, remain)) ?: continue
+            if (st.id != id) continue
+            val dxlErr = st.params.firstOrNull()?.toInt()?.and(0xFF) ?: 0
+            return COMM_SUCCESS to dxlErr
+        }
+        return COMM_RX_TIMEOUT to 0
+    }
 
     private fun readOneStatusPacket(timeoutMs: Int): StatusPacket? {
         val p = port ?: return null
@@ -384,9 +999,9 @@ class DynamixelController(private val context: Context) {
             ((b[off + 3].toInt() and 0xFF) shl 24)
     }
 
-    private fun ticksToRad(ticks: Int): Float {
-        val t = ticks.coerceIn(0, 4095)
-        return (t - 2048).toFloat() * (PI.toFloat() / 2048f)
+    private fun ticksToRadExtended(ticks: Int): Float {
+        // Extended position mode: signed ticks, 4096 ticks per revolution.
+        return ticks.toFloat() * (PI.toFloat() / 2048f)
     }
 
     private fun kdToReg(kd: Float): Int {

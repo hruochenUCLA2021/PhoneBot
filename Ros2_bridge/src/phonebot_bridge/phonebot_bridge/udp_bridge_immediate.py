@@ -123,7 +123,8 @@ class UdpToRos2ImmediateBridge(Node):
         self.pub_batt.publish(bmsg)
 
         # Motor present state (from sensor packet v2)
-        if pkt.motor_pos_rad is not None and pkt.motor_vel_rad_s is not None:
+        # Only publish when the phone marked it as valid; otherwise arrays may be placeholders (e.g., zeros).
+        if (pkt.flags & 0x1) != 0 and pkt.motor_pos_rad is not None and pkt.motor_vel_rad_s is not None:
             j = JointState()
             j.header.stamp = now
             j.header.frame_id = "phone"

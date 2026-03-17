@@ -112,17 +112,15 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
 
     // Dynamixel USB motor control
     val dxlController = remember { DynamixelController(context) }
-    var motorHwEnabled by remember { mutableStateOf(false) }
     var motorHwStatus by remember { mutableStateOf("Motor HW: OFF") }
-    val dxlConfig = remember { DynamixelController.Config() } // default: ids 1..13, baud 1M, kp=5, kd=0.1
+    val dxlConfig = remember { DynamixelController.Config() } // default: ids 1..13, baud 1_000_000, kp=5, kd=0.1
     val dxlLogLines by dxlController.logLines.collectAsState()
-    var motorFbUi by remember { mutableStateOf(MotorFeedbackUiState(note = "Motor feedback: not started")) }
-    val latestMotorFbRef =
-        remember { AtomicReference<DynamixelController.MotorStatus?>(null) }
-    val motorCtrlHzRef = remember { AtomicReference<Float?>(null) }
-    val motorReadHzRef = remember { AtomicReference<Float?>(null) }
-    val ctrlRate = remember { SimpleRateEstimator() }
-    val readRate = remember { SimpleRateEstimator() }
+    val dxlMotorDiag by dxlController.motorDiag.collectAsState()
+    val dxlMotorFb by dxlController.motorFeedback.collectAsState()
+    val usbThreadRunning by dxlController.usbThreadRunning.collectAsState()
+    var usbThreadReq by remember { mutableStateOf<Boolean?>(null) }
+    var diagUsePerIdTxRx by remember { mutableStateOf(true) } // true=per-id TxRx, false=SyncRead
+    var trackPcGoals by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
         batteryMonitor.start()
@@ -131,7 +129,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
         imuMonitor.onRawUpdate = { sample ->
             if (remoteEnabled.get()) {
                 val seq = sensorSeq.incrementAndGet()
-                val fb = latestMotorFbRef.get()
+                val fb = dxlMotorFb
                 val payload =
                     PhonebotProtocol.packSensorPacket(
                         seq = seq,
@@ -148,6 +146,8 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
         udpReceiver.onMotorPacket = { pkt, hz ->
             // Do NOT touch Compose state from this thread; just store latest.
             latestMotorRef.set(pkt to hz)
+            // Provide latest goals to the USB worker thread (latest-only).
+            dxlController.setLatestPcGoals(pkt.pos.copyOf())
         }
 
         onDispose {
@@ -155,11 +155,6 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             imuMonitor.stop()
             udpSender.stop()
             udpReceiver.stop()
-            // Best-effort torque-off on app exit
-            runCatching {
-                // fire-and-forget; don't block dispose
-                motorHwEnabled = false
-            }
         }
     }
 
@@ -185,60 +180,32 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    // Motor HW enable/disable lifecycle
-    LaunchedEffect(motorHwEnabled) {
-        if (motorHwEnabled) {
-            motorHwStatus = "Motor HW: enabling..."
-            val ok = dxlController.enable(dxlConfig)
-            motorHwStatus = if (ok) "Motor HW: ON (USB)" else "Motor HW: enable failed (${dxlController.lastStatus})"
-            if (!ok) {
-                motorHwEnabled = false
-                return@LaunchedEffect
-            }
-
-            motorFbUi = MotorFeedbackUiState(note = "Motor feedback: running (~20Hz UI)")
-
-            // While enabled, stream goals AND read feedback at 100 Hz.
-            // UI remains throttled elsewhere.
-            while (isActive && motorHwEnabled) {
-                val latest = latestMotorRef.get()
-                val pkt = latest?.first
-                if (pkt != null) {
-                    dxlController.sendGoalPositionsRad(dxlConfig, pkt.pos)
-                    motorCtrlHzRef.set(ctrlRate.update(System.nanoTime()))
-                }
-                val st = dxlController.readPresentPosVel(dxlConfig)
-                motorReadHzRef.set(readRate.update(System.nanoTime()))
-                latestMotorFbRef.set(st)
-                delay(10) // 100 Hz loop
-            }
+    // USB worker thread start/stop
+    LaunchedEffect(usbThreadReq) {
+        val wantOn = usbThreadReq ?: return@LaunchedEffect
+        usbThreadReq = null
+        if (wantOn) {
+            motorHwStatus = "USB thread: starting..."
+            dxlController.setUsbDiagMode(
+                if (diagUsePerIdTxRx) DynamixelController.DiagMode.PER_ID_TXRX else DynamixelController.DiagMode.SYNC_READ,
+            )
+            dxlController.setUsbTrackPcGoals(trackPcGoals)
+            runCatching { dxlController.startUsbThread(dxlConfig) }
+            motorHwStatus = "USB thread: ON"
         } else {
-            motorHwStatus = "Motor HW: disabling..."
-            runCatching { dxlController.disable(dxlConfig) }
-            motorHwStatus = "Motor HW: OFF"
-            motorFbUi = MotorFeedbackUiState(note = "Motor feedback: stopped (motor HW off)")
-            latestMotorFbRef.set(null)
+            motorHwStatus = "USB thread: stopping..."
+            runCatching { dxlController.stopUsbThread() }
+            motorHwStatus = "USB thread: OFF"
         }
     }
 
-    // Throttle motor feedback UI to ~20 Hz.
-    LaunchedEffect(Unit) {
-        while (isActive) {
-            val st = latestMotorFbRef.get()
-            if (st != null) {
-                motorFbUi =
-                    MotorFeedbackUiState(
-                        ctrlHz = motorCtrlHzRef.get(),
-                        rxHz = st.rxHz,
-                        readHz = motorReadHzRef.get(),
-                        posRad = st.posRad?.copyOf(),
-                        velRadS = st.velRadS?.copyOf(),
-                        note = null,
-                    )
-            }
-            delay(50)
-        }
+    // Push diag/track toggles into worker thread
+    LaunchedEffect(diagUsePerIdTxRx) {
+        dxlController.setUsbDiagMode(
+            if (diagUsePerIdTxRx) DynamixelController.DiagMode.PER_ID_TXRX else DynamixelController.DiagMode.SYNC_READ,
+        )
     }
+    LaunchedEffect(trackPcGoals) { dxlController.setUsbTrackPcGoals(trackPcGoals) }
 
     // Apply runMode + target changes
     DisposableEffect(runMode, udpHost, udpPortText) {
@@ -372,12 +339,13 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     listOf(
                         "status       : $motorHwStatus",
                         "dxl note     : ${dxlController.lastStatus}",
+                        "usb thread   : ${if (usbThreadRunning) "ON" else "OFF"}",
                         "ids          : 1..13 (default)",
                         "baud         : ${dxlConfig.baudRate}",
-                        "mode         : position",
-                        "kp / kd      : 5 / 0.1 (kd maps to integer register)",
-                        "init goal    : 0 rad (~2048 ticks)",
-                        "cmd source   : UDP pos[13] (rad) @ 100Hz loop",
+                        "mode         : torque-only test (no mode/PID/goal writes)",
+                        "diag mode    : ${if (diagUsePerIdTxRx) "per-id TxRx" else "syncRead"}",
+                        "track goals  : ${if (trackPcGoals) "ON" else "OFF"}",
+                        "note         : USB I/O is single-threaded when USB thread is ON",
                     ),
             )
             MonoBlock(
@@ -385,24 +353,52 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     listOf("dxl log (latest)") +
                         dxlLogLines.takeLast(12).map { "  $it" },
             )
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { motorHwEnabled = !motorHwEnabled },
-                ) { Text(if (motorHwEnabled) "Motor HW: ON (tap to OFF)" else "Motor HW: OFF (tap to ON)") }
-            }
-
-            SectionTitle("Motor Feedback (XL430 present state)")
-            motorFbUi.note?.let { MonoBlock(lines = listOf("note         : $it")) }
             MonoBlock(
                 lines =
-                    listOf(
-                        formatHz("ctrl(Hz)", motorFbUi.ctrlHz),
-                        formatHz("dxlRx(Hz)", motorFbUi.rxHz),
-                        formatHz("read(Hz)", motorFbUi.readHz),
-                        formatFloatList("pos(rad)", motorFbUi.posRad),
-                        formatFloatList("vel(rad/s)", motorFbUi.velRadS),
-                    ),
+                    listOf("dxl motor status (id | conn | torque | mode | hwErr | Vin | Temp)") +
+                        (if (dxlMotorDiag.isEmpty()) listOf("  (no data)") else
+                            dxlMotorDiag.map { d ->
+                                val conn = if (d.connected) "Y" else "N"
+                                val tq = d.torqueEnabled?.let { if (it) "ON" else "OFF" } ?: "?"
+                                val mode = d.operatingMode?.toString() ?: "?"
+                                val hw = d.hwError?.toString() ?: "?"
+                                val vin = d.inputVoltage01V?.let { String.format("%.1fV", it / 10.0) } ?: "?"
+                                val tmp = d.temperatureC?.let { "${it}C" } ?: "?"
+                                "  ${d.id.toString().padStart(2)} | $conn | ${tq.padEnd(3)} | ${mode.padEnd(2)} | ${hw.padEnd(3)} | ${vin.padEnd(5)} | $tmp"
+                            }
+                        ),
             )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { usbThreadReq = !(usbThreadRunning) },
+                ) {
+                    Text(if (usbThreadRunning) "USB thread: ON (tap to OFF)" else "USB thread: OFF (tap to ON)")
+                }
+                Button(
+                    onClick = {
+                        dxlController.enqueueTorque(enable = true)
+                        motorHwStatus = "Queued: Torque ON"
+                    },
+                    enabled = usbThreadRunning,
+                ) { Text("Enable (queue)") }
+                Button(
+                    onClick = {
+                        dxlController.enqueueTorque(enable = false)
+                        motorHwStatus = "Queued: Torque OFF"
+                    },
+                    enabled = usbThreadRunning,
+                ) { Text("Disable (queue)") }
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { diagUsePerIdTxRx = !diagUsePerIdTxRx },
+                    enabled = usbThreadRunning,
+                ) { Text(if (diagUsePerIdTxRx) "Diag: Per-ID TxRx" else "Diag: SyncRead") }
+                Button(
+                    onClick = { trackPcGoals = !trackPcGoals },
+                    enabled = usbThreadRunning,
+                ) { Text(if (trackPcGoals) "Track PC goals: ON" else "Track PC goals: OFF") }
+            }
 
             SectionTitle("IMU (fast sampling; UI throttled ~20Hz)")
             imu.note?.let { MonoBlock(lines = listOf("note         : $it")) }

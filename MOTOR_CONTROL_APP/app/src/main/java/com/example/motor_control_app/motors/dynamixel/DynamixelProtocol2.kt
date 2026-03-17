@@ -1,26 +1,16 @@
-package com.example.phonebot_app_android.motors.dynamixel
+package com.example.motor_control_app.motors.dynamixel
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Minimal Dynamixel Protocol 2.0 packet builder (enough for XL430 position control).
- *
- * Packet format:
- *  header: 0xFF 0xFF 0xFD 0x00
- *  id: u8
- *  length: u16  (instruction + params + CRC)
- *  instruction: u8
- *  params: ...
- *  crc: u16
+ * Minimal Dynamixel Protocol 2.0 packet builder (enough for XL430 read/torque/diag).
  */
 object DynamixelProtocol2 {
     private val HEADER = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0xFD.toByte(), 0x00.toByte())
 
     // Instructions
     private const val INST_WRITE: Byte = 0x03
-    private const val INST_READ: Byte = 0x02
-    private const val INST_SYNC_WRITE: Byte = 0x83.toByte()
     private const val INST_SYNC_READ: Byte = 0x82.toByte()
 
     // CRC-16/IBM (poly 0x8005, init 0x0000) as used by Dynamixel Protocol 2.0.
@@ -41,25 +31,15 @@ object DynamixelProtocol2 {
     fun buildWrite1(id: Int, addr: Int, value: Int): ByteArray =
         buildWrite(id, addr, byteArrayOf((value and 0xFF).toByte()))
 
-    fun buildWrite2(id: Int, addr: Int, value: Int): ByteArray {
-        val v = value and 0xFFFF
-        return buildWrite(
-            id,
-            addr,
-            byteArrayOf((v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte()),
-        )
-    }
-
-    fun buildWrite4(id: Int, addr: Int, value: Long): ByteArray {
-        val v = value.toInt()
+    fun buildWrite4(id: Int, addr: Int, value: Int): ByteArray {
         return buildWrite(
             id,
             addr,
             byteArrayOf(
-                (v and 0xFF).toByte(),
-                ((v shr 8) and 0xFF).toByte(),
-                ((v shr 16) and 0xFF).toByte(),
-                ((v shr 24) and 0xFF).toByte(),
+                (value and 0xFF).toByte(),
+                ((value shr 8) and 0xFF).toByte(),
+                ((value shr 16) and 0xFF).toByte(),
+                ((value shr 24) and 0xFF).toByte(),
             ),
         )
     }
@@ -76,41 +56,6 @@ object DynamixelProtocol2 {
         buf.put((addr and 0xFF).toByte())
         buf.put(((addr shr 8) and 0xFF).toByte())
         buf.put(data)
-
-        val raw = buf.array()
-        val crc = crc16(raw, 0, raw.size - 2)
-        raw[raw.size - 2] = (crc and 0xFF).toByte()
-        raw[raw.size - 1] = ((crc shr 8) and 0xFF).toByte()
-        return raw
-    }
-
-    /**
-     * SYNC_WRITE packet:
-     * params = addr(u16) + data_len(u16) + [id + data[data_len]] * N
-     */
-    fun buildSyncWrite(addr: Int, dataLen: Int, idToData: List<Pair<Int, ByteArray>>): ByteArray {
-        require(dataLen in 1..255)
-        for ((id, data) in idToData) {
-            require(id in 0..252)
-            require(data.size == dataLen)
-        }
-
-        val paramsLen = 2 + 2 + idToData.size * (1 + dataLen)
-        val lengthField = 1 + paramsLen + 2
-
-        val buf = ByteBuffer.allocate(HEADER.size + 1 + 2 + 1 + paramsLen + 2).order(ByteOrder.LITTLE_ENDIAN)
-        buf.put(HEADER)
-        buf.put(0xFE.toByte()) // broadcast ID
-        buf.putShort(lengthField.toShort())
-        buf.put(INST_SYNC_WRITE)
-        buf.put((addr and 0xFF).toByte())
-        buf.put(((addr shr 8) and 0xFF).toByte())
-        buf.put((dataLen and 0xFF).toByte())
-        buf.put(0x00) // dataLen high byte (<=255)
-        for ((id, data) in idToData) {
-            buf.put((id and 0xFF).toByte())
-            buf.put(data)
-        }
 
         val raw = buf.array()
         val crc = crc16(raw, 0, raw.size - 2)
@@ -139,33 +84,6 @@ object DynamixelProtocol2 {
         buf.put((dataLen and 0xFF).toByte())
         buf.put(((dataLen shr 8) and 0xFF).toByte())
         for (id in ids) buf.put((id and 0xFF).toByte())
-
-        val raw = buf.array()
-        val crc = crc16(raw, 0, raw.size - 2)
-        raw[raw.size - 2] = (crc and 0xFF).toByte()
-        raw[raw.size - 1] = ((crc shr 8) and 0xFF).toByte()
-        return raw
-    }
-
-    /**
-     * READ packet:
-     * params = start_addr(u16) + data_len(u16)
-     */
-    fun buildRead(id: Int, startAddr: Int, dataLen: Int): ByteArray {
-        require(id in 0..252)
-        require(dataLen in 1..65535)
-        val paramsLen = 2 + 2
-        val lengthField = 1 + paramsLen + 2 // instruction + params + CRC
-
-        val buf = ByteBuffer.allocate(HEADER.size + 1 + 2 + 1 + paramsLen + 2).order(ByteOrder.LITTLE_ENDIAN)
-        buf.put(HEADER)
-        buf.put((id and 0xFF).toByte())
-        buf.putShort(lengthField.toShort())
-        buf.put(INST_READ)
-        buf.put((startAddr and 0xFF).toByte())
-        buf.put(((startAddr shr 8) and 0xFF).toByte())
-        buf.put((dataLen and 0xFF).toByte())
-        buf.put(((dataLen shr 8) and 0xFF).toByte())
 
         val raw = buf.array()
         val crc = crc16(raw, 0, raw.size - 2)
@@ -205,5 +123,4 @@ object DynamixelProtocol2 {
         return out.copyOf(wi)
     }
 }
-
 
