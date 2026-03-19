@@ -90,6 +90,10 @@ cat ~/.ssh/hrc_raspberrypi_5.pub
 
 
 
+this is only need for serverversion of ubuntu, not the gui version:
+echo 'alias enable_git="ssh-add ~/.ssh/hrc_raspberrypi_5 2>/dev/null"' >> ~/.bashrc
+echo 'alias enable_git="ssh-add ~/.ssh/hrc_pi_zero 2>/dev/null"' >> ~/.bashrc
+
 
 shwo the memory more clearly:
 sudo apt install smem
@@ -101,3 +105,21 @@ smem -r
 how to scp files , copy move files :
 scp -r hrc@192.168.20.11:~/Documents/PhoneBot_HWdriver/ros2 ~/
 hrc@192.168.20.11 is the pi 5 !!! 
+
+
+
+
+
+for the usb delays :
+cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+
+
+pip install . --break-system-packages
+sudo cp 00-WestwoodRobotics.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm control --reload
+sudo udevadm trigger
+
+
+ros2 topic hz /phonebot/motor_state --window 50
