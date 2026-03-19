@@ -1,3 +1,23 @@
+ssh hrc@192.168.20.33
+using apollo network 
+romela111111
+
+
+HWdriver 
+
+
+
+radxa board:
+rock
+rock
+
+192.168.20.34
+also apollo
+
+ssh rock@192.168.20.34
+
+
+
 source install/setup.bash
 (RL_env_3_12) hrc@hrc-Nitro-ANV15-51:/media/hrc/T7_UBUNTU_ONLY/android_humanoid_all_files/PhoneBot/Ros2_bridge$ 
 ros2 launch robot_visualizer phonebot_visualizer.launch.py
@@ -125,3 +145,4 @@ sudo udevadm trigger
 
 
 ros2 topic hz /phonebot/motor_state --window 50
+ros2 topic hz /phonebot/motor_state_full --window 50
