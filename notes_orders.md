@@ -91,8 +91,10 @@ cat ~/.ssh/hrc_raspberrypi_5.pub
 
 
 this is only need for serverversion of ubuntu, not the gui version:
-echo 'alias enable_git="ssh-add ~/.ssh/hrc_raspberrypi_5 2>/dev/null"' >> ~/.bashrc
-echo 'alias enable_git="ssh-add ~/.ssh/hrc_pi_zero 2>/dev/null"' >> ~/.bashrc
+
+
+echo 'alias enable_git="eval \"\$(ssh-agent -s)\" && ssh-add ~/.ssh/hrc_raspberrypi_5 2>/dev/null"' >> ~/.bashrc
+echo 'alias enable_git="eval \"\$(ssh-agent -s)\" && ssh-add ~/.ssh/hrc_pi_zero 2>/dev/null"' >> ~/.bashrc
 
 
 shwo the memory more clearly:
