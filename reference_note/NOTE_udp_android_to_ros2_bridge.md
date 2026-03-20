@@ -12,7 +12,7 @@ This setup avoids `ros2_android`/`ros2_java` by sending phone data over **UDP** 
 On the screen, set:
 - `PC IP / Host`
 - `UDP Port` (default `5005`)
-check the pc ip by ifconfig, it is right now 192.168.20.11 
+check the pc ip by ifconfig, it is right now 192.168.20.15 
 
 
 

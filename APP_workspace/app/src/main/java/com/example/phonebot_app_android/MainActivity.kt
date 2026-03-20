@@ -36,16 +36,20 @@ import com.example.phonebot_app_android.system.BatteryMonitor
 import com.example.phonebot_app_android.ui.theme.PhoneBot_App_AndroidTheme
 import android.view.WindowManager
 import com.example.phonebot_app_android.network.UdpSender
-import java.util.concurrent.atomic.AtomicBoolean
 import com.example.phonebot_app_android.network.PhonebotProtocol
 import com.example.phonebot_app_android.network.UdpReceiver
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import com.example.phonebot_app_android.motors.dynamixel.DynamixelController
+import kotlin.math.PI
+import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -62,9 +66,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class RunMode { LOCAL, REMOTE_UDP }
-
-private data class MotorUiState(
+private data class MotorCmdUiState(
     val seq: Long = 0L,
     val tsNs: Long = 0L,
     val hz: Float? = null,
@@ -74,12 +76,16 @@ private data class MotorUiState(
     val note: String? = null,
 )
 
-private data class MotorFeedbackUiState(
-    val ctrlHz: Float? = null,
-    val rxHz: Float? = null,
-    val readHz: Float? = null,
+private data class MotorStatusUiState(
+    val seq: Long = 0L,
+    val tsNs: Long = 0L,
+    val hz: Float? = null,
+    val pwmPercent: FloatArray? = null,
+    val loadPercent: FloatArray? = null,
     val posRad: FloatArray? = null,
     val velRadS: FloatArray? = null,
+    val vinV: FloatArray? = null,
+    val tempC: FloatArray? = null,
     val note: String? = null,
 )
 
@@ -96,64 +102,62 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     var imu by remember { mutableStateOf(ImuState(note = "Starting IMU...")) }
 
     // UDP streaming
-    var runMode by remember { mutableStateOf(RunMode.LOCAL) }
-    var udpHost by remember { mutableStateOf("192.168.20.11") }
+    var udpHost by remember { mutableStateOf("192.168.20.15") }
     var udpPortText by remember { mutableStateOf("5005") }
-    val udpSender = remember { UdpSender() }
-    val remoteEnabled = remember { AtomicBoolean(false) }
+    val udpSensorSender = remember { UdpSender() }
+    val udpCtrlSender = remember { UdpSender() }
+    var udpEnabled by remember { mutableStateOf(false) }
     val sensorSeq = remember { AtomicLong(0L) }
+    val ctrlSeq = remember { AtomicLong(0L) }
 
     // Motor RX (PC -> Android)
     var motorListenPortText by remember { mutableStateOf("6006") }
     val udpReceiver = remember { UdpReceiver() }
-    var motorUi by remember { mutableStateOf(MotorUiState(note = "Waiting for motor UDP...")) }
-    val latestMotorRef =
+    var motorCmdUi by remember { mutableStateOf(MotorCmdUiState(note = "Waiting for motor UDP...")) }
+    var motorStatusUi by remember { mutableStateOf(MotorStatusUiState(note = "Waiting for motor status UDP...")) }
+    val latestMotorCmdRef =
         remember { AtomicReference<Pair<PhonebotProtocol.MotorPacket, Float?>?>(null) }
+    val latestMotorStatusRef =
+        remember { AtomicReference<Pair<PhonebotProtocol.MotorStatusPacket, Float?>?>(null) }
 
-    // Dynamixel USB motor control
-    val dxlController = remember { DynamixelController(context) }
-    var motorHwStatus by remember { mutableStateOf("Motor HW: OFF") }
-    val dxlConfig = remember { DynamixelController.Config() } // default: ids 1..13, baud 1_000_000, kp=5, kd=0.1
-    val dxlLogLines by dxlController.logLines.collectAsState()
-    val dxlMotorDiag by dxlController.motorDiag.collectAsState()
-    val dxlMotorFb by dxlController.motorFeedback.collectAsState()
-    val usbThreadRunning by dxlController.usbThreadRunning.collectAsState()
-    var usbThreadReq by remember { mutableStateOf<Boolean?>(null) }
-    var diagUsePerIdTxRx by remember { mutableStateOf(true) } // true=per-id TxRx, false=SyncRead
-    var trackPcGoals by remember { mutableStateOf(false) }
+    // Motor control (Android -> PC -> ROS2 -> Pi)
+    var testSwingOn by remember { mutableStateOf(false) }
+    var swingOfferHz by remember { mutableStateOf<Float?>(null) }
+    val swingOfferHzRef = remember { AtomicReference<Float?>(null) }
+    val swingExecRef = remember { AtomicReference<ScheduledExecutorService?>(null) }
+    val swingFutureRef = remember { AtomicReference<ScheduledFuture<*>?>(null) }
 
     DisposableEffect(Unit) {
         batteryMonitor.start()
 
         imuMonitor.onUiUpdate = { imu = it }
         imuMonitor.onRawUpdate = { sample ->
-            if (remoteEnabled.get()) {
+            if (udpEnabled) {
                 val seq = sensorSeq.incrementAndGet()
-                val fb = dxlMotorFb
                 val payload =
                     PhonebotProtocol.packSensorPacket(
                         seq = seq,
                         imu = sample,
                         battery = batteryMonitor.state.value,
-                        motorPosRad = fb?.posRad,
-                        motorVelRadS = fb?.velRadS,
                     )
-                udpSender.offer(payload)
+                udpSensorSender.offer(payload)
             }
         }
         imuMonitor.startFast()
 
         udpReceiver.onMotorPacket = { pkt, hz ->
             // Do NOT touch Compose state from this thread; just store latest.
-            latestMotorRef.set(pkt to hz)
-            // Provide latest goals to the USB worker thread (latest-only).
-            dxlController.setLatestPcGoals(pkt.pos.copyOf())
+            latestMotorCmdRef.set(pkt to hz)
+        }
+        udpReceiver.onMotorStatusPacket = { pkt, hz ->
+            latestMotorStatusRef.set(pkt to hz)
         }
 
         onDispose {
             batteryMonitor.stop()
             imuMonitor.stop()
-            udpSender.stop()
+            udpSensorSender.stop()
+            udpCtrlSender.stop()
             udpReceiver.stop()
         }
     }
@@ -161,12 +165,11 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     // Throttle motor UI updates to ~20Hz (avoid formatting/recompose cost at motor packet rate).
     LaunchedEffect(Unit) {
         while (isActive) {
-            val latest = latestMotorRef.get()
-            if (latest != null) {
-                val (pkt, hz) = latest
-                // Copy arrays so UI holds a stable snapshot (safe even if parsing becomes reuse-based later).
-                motorUi =
-                    MotorUiState(
+            val latestCmd = latestMotorCmdRef.get()
+            if (latestCmd != null) {
+                val (pkt, hz) = latestCmd
+                motorCmdUi =
+                    MotorCmdUiState(
                         seq = pkt.seq,
                         tsNs = pkt.tsNs,
                         hz = hz,
@@ -176,47 +179,41 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                         note = null,
                     )
             }
+            val latestSt = latestMotorStatusRef.get()
+            if (latestSt != null) {
+                val (pkt, hz) = latestSt
+                motorStatusUi =
+                    MotorStatusUiState(
+                        seq = pkt.seq,
+                        tsNs = pkt.tsNs,
+                        hz = hz,
+                        pwmPercent = pkt.pwmPercent.copyOf(),
+                        loadPercent = pkt.loadPercent.copyOf(),
+                        posRad = pkt.posRad.copyOf(),
+                        velRadS = pkt.velRadS.copyOf(),
+                        vinV = pkt.vinV.copyOf(),
+                        tempC = pkt.tempC.copyOf(),
+                        note = null,
+                    )
+            }
+            swingOfferHz = swingOfferHzRef.get()
             delay(50) // ~20 Hz
         }
     }
 
-    // USB worker thread start/stop
-    LaunchedEffect(usbThreadReq) {
-        val wantOn = usbThreadReq ?: return@LaunchedEffect
-        usbThreadReq = null
-        if (wantOn) {
-            motorHwStatus = "USB thread: starting..."
-            dxlController.setUsbDiagMode(
-                if (diagUsePerIdTxRx) DynamixelController.DiagMode.PER_ID_TXRX else DynamixelController.DiagMode.SYNC_READ,
-            )
-            dxlController.setUsbTrackPcGoals(trackPcGoals)
-            runCatching { dxlController.startUsbThread(dxlConfig) }
-            motorHwStatus = "USB thread: ON"
-        } else {
-            motorHwStatus = "USB thread: stopping..."
-            runCatching { dxlController.stopUsbThread() }
-            motorHwStatus = "USB thread: OFF"
-        }
-    }
-
-    // Push diag/track toggles into worker thread
-    LaunchedEffect(diagUsePerIdTxRx) {
-        dxlController.setUsbDiagMode(
-            if (diagUsePerIdTxRx) DynamixelController.DiagMode.PER_ID_TXRX else DynamixelController.DiagMode.SYNC_READ,
-        )
-    }
-    LaunchedEffect(trackPcGoals) { dxlController.setUsbTrackPcGoals(trackPcGoals) }
-
-    // Apply runMode + target changes
-    DisposableEffect(runMode, udpHost, udpPortText) {
+    // Apply UDP target changes (always remote UDP)
+    DisposableEffect(udpHost, udpPortText) {
         val port = udpPortText.toIntOrNull() ?: 0
-        if (runMode == RunMode.REMOTE_UDP && port in 1..65535) {
-            remoteEnabled.set(true)
-            udpSender.setTarget(udpHost, port)
-            udpSender.start()
+        if (port in 1..65535) {
+            udpEnabled = true
+            udpSensorSender.setTarget(udpHost, port)
+            udpCtrlSender.setTarget(udpHost, port)
+            udpSensorSender.start()
+            udpCtrlSender.start()
         } else {
-            remoteEnabled.set(false)
-            udpSender.stop()
+            udpEnabled = false
+            udpSensorSender.stop()
+            udpCtrlSender.stop()
         }
         onDispose { /* no-op */ }
     }
@@ -265,45 +262,126 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                 )
             }
 
-            SectionTitle("Mode")
+            SectionTitle("PC UDP target (always remote UDP)")
+            MonoBlock(
+                lines =
+                    listOf(
+                        "udp target   : ${udpHost}:${udpPortText}",
+                        "udp status   : ${(udpSensorSender.lastError ?: udpCtrlSender.lastError)?.let { "ERROR: $it" } ?: "OK"}",
+                        "sensor send  : ${udpSensorSender.lastSendHz?.let { "%.1f".format(it) } ?: "?"} Hz (latest-only)",
+                        "ctrl send    : ${udpCtrlSender.lastSendHz?.let { "%.1f".format(it) } ?: "?"} Hz (latest-only)",
+                        "format       : binary (little-endian)",
+                    ),
+            )
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { runMode = RunMode.LOCAL },
-                    enabled = runMode != RunMode.LOCAL,
-                ) { Text("Local") }
-                Button(
-                    onClick = { runMode = RunMode.REMOTE_UDP },
-                    enabled = runMode != RunMode.REMOTE_UDP,
-                ) { Text("Remote UDP") }
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = udpHost,
+                    onValueChange = { udpHost = it },
+                    label = { Text("PC IP / Host") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = udpPortText,
+                    onValueChange = { udpPortText = it.filter { c -> c.isDigit() }.take(5) },
+                    label = { Text("UDP Port") },
+                    singleLine = true,
+                )
             }
 
-            if (runMode == RunMode.REMOTE_UDP) {
-                MonoBlock(
-                    lines =
-                        listOf(
-                            "udp target   : ${udpHost}:${udpPortText}",
-                            "udp status   : ${udpSender.lastError?.let { "ERROR: $it" } ?: "OK"}",
-                            "udp send hz  : ${udpSender.lastSendHz?.let { "%.1f".format(it) } ?: "?"}",
-                            "send format  : binary (float32, little-endian)",
-                            "send policy  : latest-only (drops older packets if busy)",
+            SectionTitle("Motor control (Android → PC UDP)")
+            MonoBlock(lines = listOf("note         : torque + goal commands are sent to PC over UDP, then bridged to ROS2"))
+            MonoBlock(
+                lines =
+                    listOf(
+                        formatHz("swingOffer(Hz)", swingOfferHz),
+                        "ctrlSend(Hz) : ${udpCtrlSender.lastSendHz?.let { "%.1f".format(it) } ?: "?"} Hz (sender thread)",
+                    ),
+            )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        val seq = ctrlSeq.incrementAndGet()
+                        val payload = PhonebotProtocol.packTorquePacket(seq = seq, tsNs = System.nanoTime(), enable = true)
+                        udpCtrlSender.offer(payload)
+                    },
+                    enabled = udpEnabled,
+                ) { Text("Torque ON") }
+                Button(
+                    onClick = {
+                        val seq = ctrlSeq.incrementAndGet()
+                        val payload = PhonebotProtocol.packTorquePacket(seq = seq, tsNs = System.nanoTime(), enable = false)
+                        udpCtrlSender.offer(payload)
+                    },
+                    enabled = udpEnabled,
+                ) { Text("Torque OFF") }
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        val seq = ctrlSeq.incrementAndGet()
+                        val pos = FloatArray(13) { 0f }
+                        val vel = FloatArray(13) { 0f }
+                        val tau = FloatArray(13) { 0f }
+                        udpCtrlSender.offer(
+                            PhonebotProtocol.packMotorPacket(seq = seq, tsNs = System.nanoTime(), pos = pos, vel = vel, tau = tau),
                         )
-                )
+                    },
+                    enabled = udpEnabled,
+                ) { Text("Zero position") }
+                Button(
+                    onClick = { testSwingOn = !testSwingOn },
+                    enabled = udpEnabled,
+                ) { Text(if (testSwingOn) "Test swing: ON" else "Test swing: OFF") }
+            }
 
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        modifier = Modifier.weight(1f),
-                        value = udpHost,
-                        onValueChange = { udpHost = it },
-                        label = { Text("PC IP / Host") },
-                        singleLine = true,
-                    )
-                    OutlinedTextField(
-                        modifier = Modifier.weight(1f),
-                        value = udpPortText,
-                        onValueChange = { udpPortText = it.filter { c -> c.isDigit() }.take(5) },
-                        label = { Text("UDP Port") },
-                        singleLine = true,
-                    )
+            DisposableEffect(testSwingOn, udpEnabled) {
+                // Always stop any previous task first (defensive).
+                swingFutureRef.getAndSet(null)?.cancel(false)
+                swingExecRef.getAndSet(null)?.shutdownNow()
+                swingOfferHzRef.set(null)
+
+                if (testSwingOn && udpEnabled) {
+                    val exec =
+                        Executors.newSingleThreadScheduledExecutor { r ->
+                            Thread(r, "phonebot-swing-sender").apply { isDaemon = true }
+                        }
+                    val rate = SimpleRateEstimator(alpha = 0.1f)
+                    val ampPos = 0.25f
+                    val w = (2.0 * PI * 0.5).toFloat()
+                    val t0 = System.nanoTime()
+                    val pos = FloatArray(13)
+                    val vel = FloatArray(13) { 0f }
+                    val tau = FloatArray(13) { 0f }
+
+                    val fut =
+                        exec.scheduleAtFixedRate(
+                            {
+                                val nowNs = System.nanoTime()
+                                val t = (nowNs - t0).toFloat() * 1e-9f
+                                for (i in 0 until 13) {
+                                    val phase = 0.5f * i.toFloat()
+                                    pos[i] = ampPos * sin(w * t + phase)
+                                }
+                                val seq = ctrlSeq.incrementAndGet()
+                                udpCtrlSender.offer(
+                                    PhonebotProtocol.packMotorPacket(seq = seq, tsNs = nowNs, pos = pos, vel = vel, tau = tau),
+                                )
+                                swingOfferHzRef.set(rate.update(nowNs))
+                            },
+                            0L,
+                            20L,
+                            TimeUnit.MILLISECONDS,
+                        )
+                    swingExecRef.set(exec)
+                    swingFutureRef.set(fut)
+                }
+
+                onDispose {
+                    swingFutureRef.getAndSet(null)?.cancel(false)
+                    swingExecRef.getAndSet(null)?.shutdownNow()
+                    swingOfferHzRef.set(null)
                 }
             }
 
@@ -318,87 +396,23 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     )
             )
 
-            SectionTitle("Motor (PC → Android UDP)")
-            MonoBlock(lines = listOf("note         : motor UI throttled ~20Hz"))
-            motorUi.note?.let { MonoBlock(lines = listOf("last note    : $it")) }
+            SectionTitle("Motor status (PC → Android UDP)")
+            MonoBlock(lines = listOf("note         : UI throttled ~20Hz; shows receive Hz"))
+            motorStatusUi.note?.let { MonoBlock(lines = listOf("last note    : $it")) }
             MonoBlock(
                 lines =
                     listOf(
-                        "seq          : ${motorUi.seq}",
-                        "timestamp(ns): ${motorUi.tsNs}",
-                        formatHz("motorRx(Hz)", motorUi.hz),
-                        formatFloatList("pos[13]", motorUi.pos),
-                        formatFloatList("vel[13]", motorUi.vel),
-                        formatFloatList("tau[13]", motorUi.tau),
+                        "seq          : ${motorStatusUi.seq}",
+                        "timestamp(ns): ${motorStatusUi.tsNs}",
+                        formatHz("statusRx(Hz)", motorStatusUi.hz),
+                        formatFloatList("pwm(%)", motorStatusUi.pwmPercent),
+                        formatFloatList("load(%)", motorStatusUi.loadPercent),
+                        formatFloatList("pos(rad)", motorStatusUi.posRad),
+                        formatFloatList("vel(rad/s)", motorStatusUi.velRadS),
+                        formatFloatList("vin(V)", motorStatusUi.vinV),
+                        formatFloatList("temp(C)", motorStatusUi.tempC),
                     ),
             )
-
-            SectionTitle("Motor HW (USB → Dynamixel XL430)")
-            MonoBlock(
-                lines =
-                    listOf(
-                        "status       : $motorHwStatus",
-                        "dxl note     : ${dxlController.lastStatus}",
-                        "usb thread   : ${if (usbThreadRunning) "ON" else "OFF"}",
-                        "ids          : 1..13 (default)",
-                        "baud         : ${dxlConfig.baudRate}",
-                        "mode         : torque-only test (no mode/PID/goal writes)",
-                        "diag mode    : ${if (diagUsePerIdTxRx) "per-id TxRx" else "syncRead"}",
-                        "track goals  : ${if (trackPcGoals) "ON" else "OFF"}",
-                        "note         : USB I/O is single-threaded when USB thread is ON",
-                    ),
-            )
-            MonoBlock(
-                lines =
-                    listOf("dxl log (latest)") +
-                        dxlLogLines.takeLast(12).map { "  $it" },
-            )
-            MonoBlock(
-                lines =
-                    listOf("dxl motor status (id | conn | torque | mode | hwErr | Vin | Temp)") +
-                        (if (dxlMotorDiag.isEmpty()) listOf("  (no data)") else
-                            dxlMotorDiag.map { d ->
-                                val conn = if (d.connected) "Y" else "N"
-                                val tq = d.torqueEnabled?.let { if (it) "ON" else "OFF" } ?: "?"
-                                val mode = d.operatingMode?.toString() ?: "?"
-                                val hw = d.hwError?.toString() ?: "?"
-                                val vin = d.inputVoltage01V?.let { String.format("%.1fV", it / 10.0) } ?: "?"
-                                val tmp = d.temperatureC?.let { "${it}C" } ?: "?"
-                                "  ${d.id.toString().padStart(2)} | $conn | ${tq.padEnd(3)} | ${mode.padEnd(2)} | ${hw.padEnd(3)} | ${vin.padEnd(5)} | $tmp"
-                            }
-                        ),
-            )
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { usbThreadReq = !(usbThreadRunning) },
-                ) {
-                    Text(if (usbThreadRunning) "USB thread: ON (tap to OFF)" else "USB thread: OFF (tap to ON)")
-                }
-                Button(
-                    onClick = {
-                        dxlController.enqueueTorque(enable = true)
-                        motorHwStatus = "Queued: Torque ON"
-                    },
-                    enabled = usbThreadRunning,
-                ) { Text("Enable (queue)") }
-                Button(
-                    onClick = {
-                        dxlController.enqueueTorque(enable = false)
-                        motorHwStatus = "Queued: Torque OFF"
-                    },
-                    enabled = usbThreadRunning,
-                ) { Text("Disable (queue)") }
-            }
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { diagUsePerIdTxRx = !diagUsePerIdTxRx },
-                    enabled = usbThreadRunning,
-                ) { Text(if (diagUsePerIdTxRx) "Diag: Per-ID TxRx" else "Diag: SyncRead") }
-                Button(
-                    onClick = { trackPcGoals = !trackPcGoals },
-                    enabled = usbThreadRunning,
-                ) { Text(if (trackPcGoals) "Track PC goals: ON" else "Track PC goals: OFF") }
-            }
 
             SectionTitle("IMU (fast sampling; UI throttled ~20Hz)")
             imu.note?.let { MonoBlock(lines = listOf("note         : $it")) }

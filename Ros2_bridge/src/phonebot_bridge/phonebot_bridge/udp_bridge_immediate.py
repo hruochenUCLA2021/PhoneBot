@@ -8,6 +8,9 @@ from rclpy.node import Node
 from geometry_msgs.msg import Quaternion, Vector3
 from sensor_msgs.msg import BatteryState, Imu
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
+
+from motor_interfaces.msg import MotorState
 
 from . import udp_protocol
 
@@ -26,7 +29,12 @@ class UdpToRos2ImmediateBridge(Node):
         self.declare_parameter("bind_ip", "0.0.0.0")
         self.declare_parameter("bind_port", 5005)
         self.declare_parameter("topic_ns", "phonebot")
+        # ROS topic to publish motor commands to (from Android -> UDP -> this bridge)
         self.declare_parameter("motor_topic", "/phonebot/motor_cmd")
+        # ROS topic to publish torque enable to (from Android -> UDP -> this bridge)
+        self.declare_parameter("torque_topic", "/phonebot/torque_enable")
+        # ROS topic to subscribe motor state from (Pi HWdriver -> ROS2 -> this bridge -> UDP -> Android)
+        self.declare_parameter("motor_state_full_topic", "/phonebot/motor_state_full")
         self.declare_parameter("android_ip", "192.168.20.2")
         self.declare_parameter("android_port", 6006)
 
@@ -34,16 +42,28 @@ class UdpToRos2ImmediateBridge(Node):
         bind_port = self.get_parameter("bind_port").get_parameter_value().integer_value
         topic_ns = self.get_parameter("topic_ns").get_parameter_value().string_value.strip("/")
         motor_topic = self.get_parameter("motor_topic").get_parameter_value().string_value
+        torque_topic = self.get_parameter("torque_topic").get_parameter_value().string_value
+        motor_state_full_topic = self.get_parameter("motor_state_full_topic").get_parameter_value().string_value
         self._android_ip = self.get_parameter("android_ip").get_parameter_value().string_value
         self._android_port = int(self.get_parameter("android_port").get_parameter_value().integer_value)
 
         self.pub_imu = self.create_publisher(Imu, f"/{topic_ns}/imu", 10)
         self.pub_imu_game = self.create_publisher(Imu, f"/{topic_ns}/imu_game", 10)
         self.pub_batt = self.create_publisher(BatteryState, f"/{topic_ns}/battery", 10)
-        self.pub_motor_state = self.create_publisher(JointState, f"/{topic_ns}/motor_state", 10)
+        # (Legacy) `motor_state` from SENSOR packets is no longer used in the current architecture.
+        # self.pub_motor_state = self.create_publisher(JointState, f"/{topic_ns}/motor_state", 10)
 
-        # Subscribe to motor commands and forward immediately to Android via UDP.
-        self._motor_sub = self.create_subscription(JointState, motor_topic, self._on_motor_cmd, 10)
+        # Android -> ROS2
+        self.pub_motor_cmd = self.create_publisher(JointState, motor_topic, 10)
+        self.pub_torque = self.create_publisher(Bool, torque_topic, 10)
+
+        # Pi -> Android
+        self._motor_state_sub = self.create_subscription(
+            MotorState, motor_state_full_topic, self._on_motor_state_full, 10
+        )
+
+        # (Legacy) Subscribe to motor commands and forward to Android via UDP.
+        # self._motor_sub = self.create_subscription(JointState, motor_topic, self._on_motor_cmd, 10)
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind((bind_ip, int(bind_port)))
@@ -53,7 +73,7 @@ class UdpToRos2ImmediateBridge(Node):
         self._tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.get_logger().info(f"Motor UDP target (immediate): {self._android_ip}:{self._android_port}")
 
-        self._motor_seq: int = 0
+        self._tx_seq: int = 0
 
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
@@ -79,9 +99,19 @@ class UdpToRos2ImmediateBridge(Node):
                 return
 
             pkt = udp_protocol.try_parse_sensor(payload)
-            if pkt is None:
+            if pkt is not None:
+                self._publish_from_sensor(pkt)
                 continue
-            self._publish_from_sensor(pkt)
+
+            m = udp_protocol.try_parse_motor(payload)
+            if m is not None:
+                self._publish_motor_cmd(m)
+                continue
+
+            t = udp_protocol.try_parse_torque(payload)
+            if t is not None:
+                self._publish_torque(t)
+                continue
 
     def _publish_from_sensor(self, pkt: udp_protocol.SensorPacket) -> None:
         now = self.get_clock().now().to_msg()
@@ -122,31 +152,40 @@ class UdpToRos2ImmediateBridge(Node):
         bmsg.power_supply_status = _map_battery_status_code(pkt.batt_status)
         self.pub_batt.publish(bmsg)
 
-        # Motor present state (from sensor packet v2)
-        # Only publish when the phone marked it as valid; otherwise arrays may be placeholders (e.g., zeros).
-        if (pkt.flags & 0x1) != 0 and pkt.motor_pos_rad is not None and pkt.motor_vel_rad_s is not None:
-            j = JointState()
-            j.header.stamp = now
-            j.header.frame_id = "phone"
-            j.name = [f"motor_{i}" for i in range(len(pkt.motor_pos_rad))]
-            j.position = [float(x) for x in pkt.motor_pos_rad]
-            j.velocity = [float(x) for x in pkt.motor_vel_rad_s]
-            # effort left empty
-            self.pub_motor_state.publish(j)
+        # No motor state is carried inside SENSOR packets in the current architecture.
 
-    def _on_motor_cmd(self, msg: JointState) -> None:
-        """Forward motor command to Android immediately on receipt."""
+    def _publish_motor_cmd(self, pkt: udp_protocol.MotorPacket) -> None:
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = [f"motor_{i+1}" for i in range(len(pkt.pos))]
+        msg.position = [float(x) for x in pkt.pos]
+        msg.velocity = [float(x) for x in pkt.vel]
+        msg.effort = [float(x) for x in pkt.tau]
+        self.pub_motor_cmd.publish(msg)
+
+    def _publish_torque(self, pkt: udp_protocol.TorquePacket) -> None:
+        msg = Bool()
+        msg.data = bool(pkt.enable)
+        self.pub_torque.publish(msg)
+
+    def _on_motor_state_full(self, msg: MotorState) -> None:
+        # Forward present motor state to Android via UDP using MOTOR_STATUS packet format.
         ts_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
-        pos = list(msg.position) if msg.position else []
-        vel = list(msg.velocity) if msg.velocity else []
-        tau = list(msg.effort) if msg.effort else []
-
-        self._motor_seq = (self._motor_seq + 1) & 0xFFFF_FFFF
-        payload = udp_protocol.pack_motor(self._motor_seq, ts_ns, pos, vel, tau)
+        self._tx_seq = (self._tx_seq + 1) & 0xFFFF_FFFF
+        payload = udp_protocol.pack_motor_status(
+            self._tx_seq,
+            ts_ns,
+            pwm_percent=list(msg.present_pwm_percent),
+            load_percent=list(msg.present_load_percent),
+            pos_rad=list(msg.present_position_rad),
+            vel_rad_s=list(msg.present_velocity_rad_s),
+            vin_v=list(msg.present_input_voltage_v),
+            temp_c=list(msg.present_temperature_c),
+        )
         try:
             self._tx_sock.sendto(payload, (self._android_ip, self._android_port))
         except Exception as e:
-            self.get_logger().warn(f"Motor UDP send failed: {e}")
+            self.get_logger().warn(f"MotorState UDP send failed: {e}")
 
 
 def _vec3_from_xyz(v) -> Vector3:

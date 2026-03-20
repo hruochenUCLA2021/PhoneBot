@@ -1,19 +1,49 @@
 # PhoneBot — How to Run
 
-## Network Setup
+## Network Setup (current)
 
 | Device  | Default IP      | Notes                              |
 |---------|-----------------|------------------------------------|
-| PC      | `192.168.20.11` | Set in Android app as UDP target   |
+| PC      | `192.168.20.15` | Set in Android app as UDP target   |
 | Phone   | `192.168.20.2`  | Set in bridge node as `android_ip` |
 
-- PC listens on port `5005` (sensor packets from phone)
-- Phone listens on port `6006` (motor commands from PC)
+- PC listens on UDP port `5005` (packets from phone)
+- Phone listens on UDP port `6006` (packets from PC)
 - Both must be on the same WiFi network
 
 ---
 
-## 1. Build (PC side)
+## Architecture (current)
+
+- **Phone (`APP_workspace`)**:
+  - Always sends **SENSOR** UDP to PC (IMU + battery)
+  - Sends **MOTOR** UDP (goal position) and **TORQUE** UDP (enable/disable) to PC
+  - Receives **MOTOR** UDP back from PC for **motor status display** (UI throttled ~20 Hz)
+- **PC (`Ros2_bridge`)**:
+  - Runs UDP↔ROS2 bridge (`phonebot_bridge` Python OR `phonebot_bridge_cpp` C++)
+  - Subscribes to Pi motor state topic and forwards it to phone via UDP
+- **Raspberry Pi Zero 2W (`PhoneBot_HWdriver`)**:
+  - Runs motor driver, subscribes:
+    - `/phonebot/motor_cmd` (`sensor_msgs/JointState`)
+    - `/phonebot/torque_enable` (`std_msgs/Bool`)
+  - Publishes:
+    - `/phonebot/motor_state_full` (`motor_interfaces/msg/MotorState`)
+
+---
+
+## UDP packet format reference
+
+The exact binary layout is documented in:
+- `reference_note/NOTE_protocal.md`
+
+Packet types used now:
+- **SENSOR** (Android → PC) `msg_type=1`
+- **MOTOR** (Android ↔ PC) `msg_type=2` (pos/vel/tau float32[13])
+- **TORQUE** (Android → PC) `msg_type=3` (enable u8)
+
+---
+
+## 1. Build (PC side: Ros2_bridge)
 
 ```bash
 cd /media/hrc/T7_UBUNTU_ONLY/android_humanoid_all_files/PhoneBot/Ros2_bridge
@@ -30,7 +60,7 @@ colcon build --symlink-install --packages-select robot_visualizer
 
 ---
 
-## 2. Run the UDP Bridge (PC side)
+## 2. Run the UDP Bridge (PC side: Ros2_bridge)
 
 Choose one of the two bridge modes. **Immediate** is recommended for lowest latency.
 
@@ -40,10 +70,25 @@ Choose one of the two bridge modes. **Immediate** is recommended for lowest late
 ros2 run phonebot_bridge phonebot_udp_bridge_immediate
 ```
 
+Or the C++ version:
+
+```bash
+ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp
+```
+
 With custom phone IP:
 
 ```bash
 ros2 run phonebot_bridge phonebot_udp_bridge_immediate --ros-args \
+  -p android_ip:=192.168.20.2 \
+  -p android_port:=6006 \
+  -p bind_port:=5005
+```
+
+Or C++:
+
+```bash
+ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp --ros-args \
   -p android_ip:=192.168.20.2 \
   -p android_port:=6006 \
   -p bind_port:=5005
@@ -73,7 +118,7 @@ ros2 run phonebot_bridge phonebot_udp_bridge_periodic --ros-args \
 | `bind_ip`      | `0.0.0.0`         | IP to bind the UDP receive socket        |
 | `bind_port`    | `5005`            | Port to listen for sensor packets        |
 | `topic_ns`     | `phonebot`        | ROS2 topic namespace                     |
-| `motor_topic`  | `/phonebot/motor_cmd` | ROS2 topic to subscribe for motor cmds |
+| `motor_topic`  | `/phonebot/motor_cmd` | ROS2 motor command topic (pub/sub depends on bridge impl) |
 | `android_ip`   | `192.168.20.2`    | Phone's IP (for sending motor commands)  |
 | `android_port` | `6006`            | Phone's listen port for motor commands   |
 
@@ -84,13 +129,15 @@ ros2 run phonebot_bridge phonebot_udp_bridge_periodic --ros-args \
 | `/phonebot/imu`          | `sensor_msgs/Imu`          | IMU (rotation vector)         |
 | `/phonebot/imu_game`     | `sensor_msgs/Imu`          | IMU (game rotation vector)    |
 | `/phonebot/battery`      | `sensor_msgs/BatteryState` | Battery level and status      |
-| `/phonebot/motor_state`  | `sensor_msgs/JointState`   | Motor pos/vel (13 motors)     |
+| `/phonebot/motor_state`  | `sensor_msgs/JointState`   | (Legacy) motor pos/vel inside SENSOR v2 packets |
+| `/phonebot/motor_cmd`    | `sensor_msgs/JointState`   | Motor command from phone (UDP) to Pi HWdriver |
+| `/phonebot/torque_enable`| `std_msgs/Bool`            | Torque enable from phone (UDP) to Pi HWdriver |
 
-### ROS2 topic subscribed by the bridge
+### ROS2 topics subscribed by the bridge
 
 | Topic                    | Type                       | Description                   |
 |--------------------------|----------------------------|-------------------------------|
-| `/phonebot/motor_cmd`    | `sensor_msgs/JointState`   | Motor commands sent to phone  |
+| `/phonebot/motor_state_full` | `motor_interfaces/msg/MotorState` | Motor state from Pi HWdriver forwarded to phone via UDP |
 
 ---
 
@@ -148,10 +195,12 @@ Publishes test motor commands to `/phonebot/motor_cmd`.
 1. Open `APP_workspace` in Android Studio
 2. Build and install on phone
 3. On the app screen:
-   - Set **PC IP** to `192.168.20.11` (or your PC's WiFi IP)
+   - Set **PC IP** to `192.168.20.15` (or your PC's WiFi IP)
    - Set **UDP port** to `5005`
-   - Select **REMOTE_UDP** mode
-   - Enable **Motor HW** if motors are connected via USB-C serial adapter
+   - Use buttons:
+     - **Torque ON/OFF**
+     - **Zero position**
+     - **Test swing**
 
 ---
 
@@ -178,7 +227,7 @@ Terminal 3 — check topics:
 ```bash
 ros2 topic list
 ros2 topic hz /phonebot/imu_game
-ros2 topic echo /phonebot/motor_state
+ros2 topic echo /phonebot/motor_state_full
 ```
 
 ---
@@ -193,14 +242,20 @@ ros2 topic list
 ros2 topic hz /phonebot/imu_game
 
 # Check motor state rate
-ros2 topic hz /phonebot/motor_state
+ros2 topic hz /phonebot/motor_state_full
 
 # See latest IMU data
 ros2 topic echo /phonebot/imu_game --once
 
 # See latest motor positions
-ros2 topic echo /phonebot/motor_state --once
+ros2 topic echo /phonebot/motor_state_full --once
 
 # See battery
 ros2 topic echo /phonebot/battery --once
 ```
+
+
+
+source install/setup.bash
+ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp  --ros-args -p android_ip:=192.168.20.21
+ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp  --ros-args -p android_ip:=192.168.20.31

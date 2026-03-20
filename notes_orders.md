@@ -146,3 +146,10 @@ sudo udevadm trigger
 
 ros2 topic hz /phonebot/motor_state --window 50
 ros2 topic hz /phonebot/motor_state_full --window 50
+
+
+
+
+source install/setup.bash
+ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp  --ros-args -p android_ip:=192.168.20.21
+ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp  --ros-args -p android_ip:=192.168.20.31

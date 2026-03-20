@@ -14,26 +14,29 @@ object PhonebotProtocol {
     // 4-byte magic: ASCII "PBOT"
     private val MAGIC = byteArrayOf('P'.code.toByte(), 'B'.code.toByte(), 'O'.code.toByte(), 'T'.code.toByte())
 
-    // v2: SENSOR packet additionally includes motor present state (pos/vel[13]) and uses flags bit0.
-    const val VERSION: Byte = 2
+    // Single protocol version for the current architecture.
+    const val VERSION: Byte = 3
 
     const val MSG_TYPE_SENSOR: Byte = 1
     const val MSG_TYPE_MOTOR: Byte = 2
+    const val MSG_TYPE_TORQUE: Byte = 3
+    const val MSG_TYPE_MOTOR_STATUS: Byte = 4
+
+    private const val MOTOR_COUNT: Int = 13
 
     // Header: magic[4] + version[u8] + msg_type[u8] + flags[u16] + seq[u32] + ts_ns[u64] = 20 bytes
     const val HEADER_SIZE_BYTES: Int = 20
 
     // SENSOR packet total size (see NOTE_protocal.md): 116 bytes
-    // v2: 116 + (26 float32) = 220 bytes
-    const val SENSOR_PACKET_SIZE_BYTES: Int = 220
+    // (No motor arrays in SENSOR packets in the current architecture.)
+    const val SENSOR_PACKET_SIZE_BYTES: Int = 116
 
     // MOTOR packet total size (see NOTE_protocal.md): 176 bytes
     const val MOTOR_PACKET_SIZE_BYTES: Int = 176
-    // Header flags
-    private const val FLAG_MOTOR_STATE_VALID: Int = 1 shl 0
-
-
-    private const val MOTOR_COUNT: Int = 13
+    // TORQUE packet total size: header(20) + enable(u8) = 21 bytes
+    const val TORQUE_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + 1
+    // MOTOR_STATUS packet total size: header(20) + 6*13 float32 = 332 bytes
+    const val MOTOR_STATUS_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + (6 * MOTOR_COUNT * 4)
 
     data class MotorPacket(
         val seq: Long,
@@ -43,23 +46,34 @@ object PhonebotProtocol {
         val tau: FloatArray, // size 13
     )
 
+    data class TorquePacket(
+        val seq: Long,
+        val tsNs: Long,
+        val enable: Boolean,
+    )
+
+    data class MotorStatusPacket(
+        val seq: Long,
+        val tsNs: Long,
+        val pwmPercent: FloatArray, // 13
+        val loadPercent: FloatArray, // 13
+        val posRad: FloatArray, // 13
+        val velRadS: FloatArray, // 13
+        val vinV: FloatArray, // 13
+        val tempC: FloatArray, // 13
+    )
+
     fun packSensorPacket(
         seq: Long,
         imu: ImuState,
         battery: BatteryState,
-        motorPosRad: FloatArray? = null,
-        motorVelRadS: FloatArray? = null,
     ): ByteArray {
         val buf = ByteBuffer.allocate(SENSOR_PACKET_SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         // Header
         buf.put(MAGIC)
         buf.put(VERSION)
         buf.put(MSG_TYPE_SENSOR)
-        val flags =
-            if (motorPosRad != null && motorVelRadS != null &&
-                motorPosRad.size >= MOTOR_COUNT && motorVelRadS.size >= MOTOR_COUNT
-            ) FLAG_MOTOR_STATE_VALID else 0
-        buf.putShort(flags.toShort()) // flags u16
+        buf.putShort(0) // flags u16 (reserved)
         buf.putInt(seq.toInt()) // seq u32 (wrap ok)
         buf.putLong(imu.timestampNs)
 
@@ -100,15 +114,6 @@ object PhonebotProtocol {
         buf.put(mapStatusToCode(battery.status))
         buf.put(0) // reserved/padding
 
-        // v2 extension: motor present state (pos/vel), always present; use flags to indicate validity.
-        if (flags and FLAG_MOTOR_STATE_VALID != 0) {
-            for (i in 0 until MOTOR_COUNT) buf.putFloat(motorPosRad!![i])
-            for (i in 0 until MOTOR_COUNT) buf.putFloat(motorVelRadS!![i])
-        } else {
-            for (i in 0 until MOTOR_COUNT) buf.putFloat(0f)
-            for (i in 0 until MOTOR_COUNT) buf.putFloat(0f)
-        }
-
         return buf.array()
     }
 
@@ -139,6 +144,107 @@ object PhonebotProtocol {
         for (i in 0 until MOTOR_COUNT) tau[i] = buf.float
 
         return MotorPacket(seq = seq, tsNs = tsNs, pos = pos, vel = vel, tau = tau)
+    }
+
+    fun tryParseMotorStatusPacket(payload: ByteArray): MotorStatusPacket? {
+        if (payload.size < MOTOR_STATUS_PACKET_SIZE_BYTES) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+
+        val magic = ByteArray(4)
+        buf.get(magic)
+        if (!magic.contentEquals(MAGIC)) return null
+
+        val version = buf.get()
+        if (version != VERSION) return null
+
+        val msgType = buf.get()
+        if (msgType != MSG_TYPE_MOTOR_STATUS) return null
+
+        /* flags */ buf.short
+        val seq = buf.int.toLong() and 0xFFFF_FFFFL
+        val tsNs = buf.long
+
+        fun read13(): FloatArray {
+            val a = FloatArray(MOTOR_COUNT)
+            for (i in 0 until MOTOR_COUNT) a[i] = buf.float
+            return a
+        }
+
+        val pwm = read13()
+        val load = read13()
+        val pos = read13()
+        val vel = read13()
+        val vin = read13()
+        val temp = read13()
+
+        return MotorStatusPacket(
+            seq = seq,
+            tsNs = tsNs,
+            pwmPercent = pwm,
+            loadPercent = load,
+            posRad = pos,
+            velRadS = vel,
+            vinV = vin,
+            tempC = temp,
+        )
+    }
+
+    fun packMotorPacket(
+        seq: Long,
+        tsNs: Long,
+        pos: FloatArray,
+        vel: FloatArray,
+        tau: FloatArray,
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(MOTOR_PACKET_SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(MAGIC)
+        buf.put(VERSION)
+        buf.put(MSG_TYPE_MOTOR)
+        buf.putShort(0) // flags
+        buf.putInt(seq.toInt())
+        buf.putLong(tsNs)
+
+        for (i in 0 until MOTOR_COUNT) buf.putFloat(pos.getOrNull(i) ?: 0f)
+        for (i in 0 until MOTOR_COUNT) buf.putFloat(vel.getOrNull(i) ?: 0f)
+        for (i in 0 until MOTOR_COUNT) buf.putFloat(tau.getOrNull(i) ?: 0f)
+        return buf.array()
+    }
+
+    fun packTorquePacket(
+        seq: Long,
+        tsNs: Long,
+        enable: Boolean,
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(TORQUE_PACKET_SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(MAGIC)
+        buf.put(VERSION)
+        buf.put(MSG_TYPE_TORQUE)
+        buf.putShort(0) // flags
+        buf.putInt(seq.toInt())
+        buf.putLong(tsNs)
+        buf.put(if (enable) 1 else 0)
+        return buf.array()
+    }
+
+    fun tryParseTorquePacket(payload: ByteArray): TorquePacket? {
+        if (payload.size < TORQUE_PACKET_SIZE_BYTES) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+
+        val magic = ByteArray(4)
+        buf.get(magic)
+        if (!magic.contentEquals(MAGIC)) return null
+
+        val version = buf.get()
+        if (version != VERSION) return null
+
+        val msgType = buf.get()
+        if (msgType != MSG_TYPE_TORQUE) return null
+
+        /* flags */ buf.short
+        val seq = buf.int.toLong() and 0xFFFF_FFFFL
+        val tsNs = buf.long
+        val enable = (buf.get().toInt() and 0xFF) != 0
+        return TorquePacket(seq = seq, tsNs = tsNs, enable = enable)
     }
 
     private fun mapPluggedToCode(plugged: String?): Byte {

@@ -37,6 +37,7 @@ class UdpReceiver {
     private val rate = RateEstimator()
 
     var onMotorPacket: ((PhonebotProtocol.MotorPacket, Float?) -> Unit)? = null
+    var onMotorStatusPacket: ((PhonebotProtocol.MotorStatusPacket, Float?) -> Unit)? = null
 
     fun start(listenPort: Int) {
         stop()
@@ -58,9 +59,17 @@ class UdpReceiver {
                         while (running.get()) {
                             localSocket.receive(packet)
                             val payload = packet.data.copyOfRange(0, packet.length)
-                            val motor = PhonebotProtocol.tryParseMotorPacket(payload) ?: continue
                             val hz = rate.update(System.nanoTime())
-                            onMotorPacket?.invoke(motor, hz)
+                            val st = PhonebotProtocol.tryParseMotorStatusPacket(payload)
+                            if (st != null) {
+                                onMotorStatusPacket?.invoke(st, hz)
+                                continue
+                            }
+                            val motor = PhonebotProtocol.tryParseMotorPacket(payload)
+                            if (motor != null) {
+                                onMotorPacket?.invoke(motor, hz)
+                                continue
+                            }
                         }
                     } catch (t: Throwable) {
                         if (running.get()) {

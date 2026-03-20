@@ -17,7 +17,7 @@ class UdpSender {
     data class Target(val host: String, val port: Int)
 
     @Volatile private var running = false
-    @Volatile private var target: Target = Target("192.168.20.11", 5005)
+    @Volatile private var target: Target = Target("192.168.20.15", 5005)
 
     // Cache resolved destination to avoid per-packet getByName() overhead.
     @Volatile private var cachedAddress: InetAddress? = null
