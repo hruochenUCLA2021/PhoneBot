@@ -122,6 +122,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
 
     // Motor control (Android -> PC -> ROS2 -> Pi)
     var testSwingOn by remember { mutableStateOf(false) }
+    var swingHzText by remember { mutableStateOf("50") }
     var swingOfferHz by remember { mutableStateOf<Float?>(null) }
     val swingOfferHzRef = remember { AtomicReference<Float?>(null) }
     val swingExecRef = remember { AtomicReference<ScheduledExecutorService?>(null) }
@@ -330,19 +331,32 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     },
                     enabled = udpEnabled,
                 ) { Text("Zero position") }
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = swingHzText,
+                    onValueChange = { swingHzText = it.filter { c -> c.isDigit() || c == '.' }.take(6) },
+                    label = { Text("Swing Hz") },
+                    singleLine = true,
+                )
                 Button(
                     onClick = { testSwingOn = !testSwingOn },
                     enabled = udpEnabled,
                 ) { Text(if (testSwingOn) "Test swing: ON" else "Test swing: OFF") }
             }
 
-            DisposableEffect(testSwingOn, udpEnabled) {
+            val swingHz = swingHzText.toFloatOrNull()
+            val swingPeriodNs =
+                swingHz
+                    ?.takeIf { it.isFinite() && it > 0.0f }
+                    ?.let { (1_000_000_000.0 / it.toDouble()).toLong().coerceAtLeast(1L) }
+
+            DisposableEffect(testSwingOn, udpEnabled, swingPeriodNs) {
                 // Always stop any previous task first (defensive).
                 swingFutureRef.getAndSet(null)?.cancel(false)
                 swingExecRef.getAndSet(null)?.shutdownNow()
                 swingOfferHzRef.set(null)
 
-                if (testSwingOn && udpEnabled) {
+                if (testSwingOn && udpEnabled && swingPeriodNs != null) {
                     val exec =
                         Executors.newSingleThreadScheduledExecutor { r ->
                             Thread(r, "phonebot-swing-sender").apply { isDaemon = true }
@@ -371,8 +385,8 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                                 swingOfferHzRef.set(rate.update(nowNs))
                             },
                             0L,
-                            20L,
-                            TimeUnit.MILLISECONDS,
+                            swingPeriodNs,
+                            TimeUnit.NANOSECONDS,
                         )
                     swingExecRef.set(exec)
                     swingFutureRef.set(fut)
