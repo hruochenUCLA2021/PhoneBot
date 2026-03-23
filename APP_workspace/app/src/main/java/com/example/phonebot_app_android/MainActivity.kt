@@ -1,20 +1,30 @@
 package com.example.phonebot_app_android
 
+import android.Manifest
 import android.os.Bundle
+import android.content.pm.PackageManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -25,19 +35,26 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import com.example.phonebot_app_android.sensors.ImuMonitor
 import com.example.phonebot_app_android.sensors.ImuState
 import com.example.phonebot_app_android.system.BatteryMonitor
 import com.example.phonebot_app_android.ui.theme.PhoneBot_App_AndroidTheme
 import android.view.WindowManager
+import android.view.TextureView
+import android.util.Range
 import com.example.phonebot_app_android.network.UdpSender
 import com.example.phonebot_app_android.network.PhonebotProtocol
 import com.example.phonebot_app_android.network.UdpReceiver
+import com.example.phonebot_app_android.camera.CameraOption
+import com.example.phonebot_app_android.camera.CameraTestingController
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.concurrent.Executors
@@ -47,6 +64,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlin.math.PI
 import kotlin.math.sin
@@ -90,6 +109,62 @@ private data class MotorStatusUiState(
 )
 
 @Composable
+private fun SectionTitle(text: String) {
+    Text(text = text, style = MaterialTheme.typography.titleMedium)
+}
+
+@Composable
+private fun MonoBlock(lines: List<String>) {
+    Column(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        for (line in lines) {
+            Text(text = line, fontFamily = FontFamily.Monospace)
+        }
+    }
+}
+
+@Composable
+private fun DropdownSelector(
+    label: String,
+    value: String,
+    options: List<String>,
+    enabled: Boolean = true,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = enabled,
+            onClick = { expanded = true },
+        ) {
+            val shown = value.ifBlank { "(select)" }
+            Text("${label}: ${shown}")
+        }
+        DropdownMenu(
+            expanded = expanded && enabled,
+            onDismissRequest = { expanded = false },
+        ) {
+            for (opt in options) {
+                DropdownMenuItem(
+                    text = { Text(opt) },
+                    onClick = {
+                        expanded = false
+                        onSelect(opt)
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
 
@@ -128,6 +203,26 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val swingExecRef = remember { AtomicReference<ScheduledExecutorService?>(null) }
     val swingFutureRef = remember { AtomicReference<ScheduledFuture<*>?>(null) }
 
+    // Page selection
+    var page by rememberSaveable { mutableStateOf(0) } // 0=dashboard, 1=camera testing
+
+    // Camera testing page
+    val camCtrl = remember { CameraTestingController(context) }
+    var camOn by rememberSaveable { mutableStateOf(false) }
+    var camOptions by remember { mutableStateOf<List<CameraOption>>(emptyList()) }
+    var camId by rememberSaveable { mutableStateOf("") }
+    var camResText by rememberSaveable { mutableStateOf("") }
+    var camFpsText by rememberSaveable { mutableStateOf("") }
+    var camPreviewFps by remember { mutableStateOf<Float?>(null) }
+    var camError by remember { mutableStateOf<String?>(null) }
+    var camTextureView by remember { mutableStateOf<TextureView?>(null) }
+    val cameraLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                camOn = true
+            }
+        }
+
     DisposableEffect(Unit) {
         batteryMonitor.start()
 
@@ -160,6 +255,60 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             udpSensorSender.stop()
             udpCtrlSender.stop()
             udpReceiver.stop()
+            camCtrl.stop()
+        }
+    }
+
+    // Refresh camera info at ~1Hz while on camera page.
+    LaunchedEffect(page) {
+        if (page != 1) return@LaunchedEffect
+        while (isActive && page == 1) {
+            val opts =
+                withContext(Dispatchers.Default) {
+                    camCtrl.listCameras()
+                }
+            camOptions = opts
+            camError = camCtrl.lastError
+            camPreviewFps = camCtrl.previewFpsHz
+            if (camId.isBlank() && opts.isNotEmpty()) camId = opts.first().cameraId
+            delay(1000)
+        }
+    }
+
+    // Stop camera when leaving camera page.
+    LaunchedEffect(page) {
+        if (page != 1) {
+            camOn = false
+            camCtrl.stop()
+        }
+    }
+
+    // Start/stop camera preview when toggled.
+    DisposableEffect(camOn, camId, camResText, camFpsText, camTextureView) {
+        val tv = camTextureView
+        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (!camOn || tv == null || !granted) {
+            camCtrl.stop()
+            onDispose { /* no-op */ }
+        } else {
+            val opt = camOptions.firstOrNull { it.cameraId == camId }
+            val size =
+                opt?.previewSizes?.firstOrNull { s -> "${s.width}x${s.height}" == camResText }
+                    ?: opt?.previewSizes?.firstOrNull()
+            val fpsRange =
+                opt?.aeFpsRanges?.firstOrNull { r -> "${r.lower}-${r.upper}" == camFpsText }
+                    ?: opt?.aeFpsRanges?.firstOrNull()
+            if (size != null) {
+                camCtrl.startPreview(
+                    tv,
+                    CameraTestingController.StartConfig(
+                        cameraId = camId,
+                        targetSize = size,
+                        targetFpsRange = fpsRange,
+                    )
+                )
+            }
+            onDispose { camCtrl.stop() }
         }
     }
 
@@ -244,6 +393,109 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { page = 0 }) { Text("Dashboard") }
+                Button(onClick = { page = 1 }) { Text("Camera testing") }
+            }
+
+            if (page == 1) {
+                SectionTitle("Camera testing page")
+
+                val camGranted =
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+                MonoBlock(
+                    lines =
+                        listOf(
+                            "camera perm : ${if (camGranted) "GRANTED" else "MISSING"}",
+                            "cam on      : $camOn",
+                            formatHz("camFPS(Hz)", camPreviewFps),
+                            "cam error   : ${camError ?: "OK"}",
+                        ),
+                )
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            if (!camGranted) {
+                                cameraLauncher.launch(Manifest.permission.CAMERA)
+                            } else {
+                                camOn = !camOn
+                            }
+                        },
+                    ) { Text(if (camOn) "Camera: ON" else "Camera: OFF") }
+                }
+
+                val selected = camOptions.firstOrNull { it.cameraId == camId } ?: camOptions.firstOrNull()
+                val fpsOptions = selected?.aeFpsRanges?.map { r -> "${r.lower}-${r.upper}" } ?: emptyList()
+                val resOptions = selected?.previewSizes?.map { s -> "${s.width}x${s.height}" } ?: emptyList()
+
+                LaunchedEffect(selected?.cameraId, camOptions) {
+                    val ids = camOptions.map { it.cameraId }
+                    if (ids.isNotEmpty() && camId !in ids) camId = ids.first()
+                    val s = camOptions.firstOrNull { it.cameraId == camId }
+                    val fps = s?.aeFpsRanges?.map { r -> "${r.lower}-${r.upper}" } ?: emptyList()
+                    val res = s?.previewSizes?.map { sz -> "${sz.width}x${sz.height}" } ?: emptyList()
+                    if (camFpsText.isBlank() && fps.isNotEmpty()) camFpsText = fps.first()
+                    if (camFpsText.isNotBlank() && fps.isNotEmpty() && camFpsText !in fps) camFpsText = fps.first()
+                    if (camResText.isBlank() && res.isNotEmpty()) camResText = res.first()
+                    if (camResText.isNotBlank() && res.isNotEmpty() && camResText !in res) camResText = res.first()
+                }
+
+                DropdownSelector(
+                    label = "Camera ID",
+                    value = camId,
+                    options = camOptions.map { it.cameraId },
+                    onSelect = { camId = it },
+                )
+                DropdownSelector(
+                    label = "Target FPS range",
+                    value = camFpsText,
+                    options = fpsOptions,
+                    enabled = fpsOptions.isNotEmpty(),
+                    onSelect = { camFpsText = it },
+                )
+                DropdownSelector(
+                    label = "Resolution",
+                    value = camResText,
+                    options = resOptions,
+                    enabled = resOptions.isNotEmpty(),
+                    onSelect = { camResText = it },
+                )
+
+                SectionTitle("Camera preview")
+                val selectedSize =
+                    selected?.previewSizes?.firstOrNull { s -> "${s.width}x${s.height}" == camResText }
+                        ?: selected?.previewSizes?.firstOrNull()
+                val aspect =
+                    if (selectedSize != null && selectedSize.height > 0) {
+                        selectedSize.width.toFloat() / selectedSize.height.toFloat()
+                    } else {
+                        16f / 9f
+                    }
+                Box(modifier = Modifier.fillMaxWidth().aspectRatio(aspect).padding(top = 8.dp)) {
+                    AndroidView(
+                        factory = { ctx -> TextureView(ctx).also { camTextureView = it } },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+
+                MonoBlock(
+                    lines =
+                        listOf(
+                            "available cameras:",
+                        ) + camOptions.flatMap { opt ->
+                            val isLogical = opt.capabilities.contains(android.hardware.camera2.CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
+                            listOf(
+                                "- id=${opt.cameraId} lensFacing=${opt.lensFacing} orient=${opt.sensorOrientationDeg} logicalMultiCam=$isLogical",
+                                "  physicalIds=${opt.physicalCameraIds.joinToString()} (empty means not a logical multi-cam id)",
+                                "  fpsRanges=${opt.aeFpsRanges.joinToString { "${it.lower}-${it.upper}" }}",
+                                "  previewSizes=${opt.previewSizes.joinToString { "${it.width}x${it.height}" }}",
+                            )
+                        },
+                )
+            } else {
+
             SectionTitle("Network")
             val ip = getLocalIpv4Address() ?: "?"
             MonoBlock(
@@ -447,27 +699,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                         formatVec3("gyro(rad/s)", imu.gyro),
                     )
             )
-        }
-    }
-}
-
-@Composable
-private fun SectionTitle(text: String) {
-    Text(text = text, style = MaterialTheme.typography.titleMedium)
-}
-
-@Composable
-private fun MonoBlock(lines: List<String>) {
-    Column(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-                .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        for (line in lines) {
-            Text(text = line, fontFamily = FontFamily.Monospace)
+            }
         }
     }
 }
