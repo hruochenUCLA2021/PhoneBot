@@ -12,12 +12,16 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.Image
+import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.graphics.ImageFormat
 
 data class CameraOption(
     val cameraId: String,
@@ -38,6 +42,7 @@ class CameraTestingController(private val context: Context) {
 
     private var camDevice: CameraDevice? = null
     private var session: CameraCaptureSession? = null
+    private var imageReader: ImageReader? = null
 
     @Volatile var lastError: String? = null
         private set
@@ -45,6 +50,12 @@ class CameraTestingController(private val context: Context) {
     // Updated from camera callback thread.
     @Volatile var previewFpsHz: Float? = null
         private set
+
+    /**
+     * Optional analysis callback (called on the camera background thread).
+     * The receiver MUST close the [Image] (or close it later after async processing).
+     */
+    @Volatile var onFrame: ((image: Image, rotationDegrees: Int) -> Unit)? = null
 
     private var fpsCount: Int = 0
     private var fpsLastReportNs: Long = 0L
@@ -111,6 +122,8 @@ class CameraTestingController(private val context: Context) {
         session = null
         runCatching { camDevice?.close() }
         camDevice = null
+        runCatching { imageReader?.close() }
+        imageReader = null
         previewFpsHz = null
         fpsCount = 0
         fpsLastReportNs = 0L
@@ -124,6 +137,8 @@ class CameraTestingController(private val context: Context) {
         val cameraId: String,
         val targetSize: Size,
         val targetFpsRange: Range<Int>?,
+        val rotationDegrees: Int = 0,
+        val enableAnalysis: Boolean = true,
     )
 
     /**
@@ -171,14 +186,45 @@ class CameraTestingController(private val context: Context) {
             lastError = "setDefaultBufferSize failed: ${t.message ?: t::class.java.simpleName}"
         }
 
-        val surface = Surface(st)
+        val previewSurface = Surface(st)
+
+        val readerSurface: Surface? =
+            if (cfg.enableAnalysis) {
+                runCatching {
+                    ImageReader.newInstance(cfg.targetSize.width, cfg.targetSize.height, ImageFormat.YUV_420_888, 2).also { r ->
+                        imageReader = r
+                        r.setOnImageAvailableListener(
+                            { rr ->
+                                val img = runCatching { rr.acquireLatestImage() }.getOrNull()
+                                if (img == null) return@setOnImageAvailableListener
+                                val cb = onFrame
+                                if (cb != null) {
+                                    try {
+                                        cb(img, cfg.rotationDegrees)
+                                    } catch (t: Throwable) {
+                                        lastError = "onFrame failed: ${t.message ?: t::class.java.simpleName}"
+                                        runCatching { img.close() }
+                                    }
+                                } else {
+                                    runCatching { img.close() }
+                                }
+                            },
+                            handler,
+                        )
+                    }
+                }.onFailure { t ->
+                    lastError = "ImageReader failed: ${t.message ?: t::class.java.simpleName}"
+                }.getOrNull()?.surface
+            } else {
+                null
+            }
 
         camManager.openCamera(
             cfg.cameraId,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     camDevice = camera
-                    createSession(camera, surface, cfg, handler)
+                    createSession(camera, previewSurface, readerSurface, cfg, handler)
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
@@ -197,16 +243,26 @@ class CameraTestingController(private val context: Context) {
         )
     }
 
-    private fun createSession(camera: CameraDevice, surface: Surface, cfg: StartConfig, handler: Handler) {
+    private fun createSession(
+        camera: CameraDevice,
+        previewSurface: Surface,
+        readerSurface: Surface?,
+        cfg: StartConfig,
+        handler: Handler
+    ) {
         try {
+            val outputs = mutableListOf<Surface>()
+            outputs.add(previewSurface)
+            if (readerSurface != null) outputs.add(readerSurface)
             camera.createCaptureSession(
-                listOf(surface),
+                outputs,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(sess: CameraCaptureSession) {
                         session = sess
                         val req =
                             camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                                addTarget(surface)
+                                addTarget(previewSurface)
+                                if (readerSurface != null) addTarget(readerSurface)
                                 set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                                 cfg.targetFpsRange?.also { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
                             }

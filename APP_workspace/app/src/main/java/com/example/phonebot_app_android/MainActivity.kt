@@ -37,6 +37,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -55,6 +58,13 @@ import com.example.phonebot_app_android.network.PhonebotProtocol
 import com.example.phonebot_app_android.network.UdpReceiver
 import com.example.phonebot_app_android.camera.CameraOption
 import com.example.phonebot_app_android.camera.CameraTestingController
+import android.graphics.Rect
+import android.util.Size
+import android.view.Surface
+import android.os.Looper
+import android.os.Handler
+import android.media.Image
+import java.util.concurrent.atomic.AtomicBoolean
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.concurrent.Executors
@@ -69,6 +79,27 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlin.math.PI
 import kotlin.math.sin
+import kotlin.math.max
+import kotlin.math.min
+
+// ML Kit
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.Face
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetector
+import com.google.mlkit.vision.face.FaceDetectorOptions
+
+enum class VisionLibrary { NONE, MLKIT, MEDIAPIPE }
+enum class VisionTask { NONE, FACE, POSE, OBJECT, HAND }
+
+private data class NormRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+private data class VisionOverlayState(
+    val imageWidth: Int,
+    val imageHeight: Int,
+    val boxes: List<NormRect> = emptyList(),
+    val label: String? = null,
+    val procHz: Float? = null,
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -111,6 +142,28 @@ private data class MotorStatusUiState(
 @Composable
 private fun SectionTitle(text: String) {
     Text(text = text, style = MaterialTheme.typography.titleMedium)
+}
+
+@Composable
+private fun VisionOverlay(overlay: VisionOverlayState?) {
+    if (overlay == null) return
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val w = size.width
+        val h = size.height
+        val stroke = Stroke(width = 3f)
+        for (b in overlay.boxes) {
+            val l = b.left * w
+            val t = b.top * h
+            val r = b.right * w
+            val bb = b.bottom * h
+            drawRect(
+                color = Color(0xFF00FF00),
+                topLeft = androidx.compose.ui.geometry.Offset(l, t),
+                size = androidx.compose.ui.geometry.Size(max(0f, r - l), max(0f, bb - t)),
+                style = stroke,
+            )
+        }
+    }
 }
 
 @Composable
@@ -216,6 +269,15 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     var camPreviewFps by remember { mutableStateOf<Float?>(null) }
     var camError by remember { mutableStateOf<String?>(null) }
     var camTextureView by remember { mutableStateOf<TextureView?>(null) }
+    var visionLib by rememberSaveable { mutableStateOf(VisionLibrary.NONE) }
+    var visionTask by rememberSaveable { mutableStateOf(VisionTask.NONE) }
+    var visionNote by remember { mutableStateOf<String?>(null) }
+    val visionBusy = remember { AtomicBoolean(false) }
+    val visionOverlayRef = remember { AtomicReference<VisionOverlayState?>(null) }
+    var visionOverlayUi by remember { mutableStateOf<VisionOverlayState?>(null) }
+    val visionRate = remember { SimpleRateEstimator(alpha = 0.1f) }
+
+    val faceDetectorRef = remember { AtomicReference<FaceDetector?>(null) }
     val cameraLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
@@ -259,7 +321,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    // Refresh camera info at ~1Hz while on camera page.
+    // Refresh camera info at ~2Hz while on camera page.
     LaunchedEffect(page) {
         if (page != 1) return@LaunchedEffect
         while (isActive && page == 1) {
@@ -271,7 +333,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             camError = camCtrl.lastError
             camPreviewFps = camCtrl.previewFpsHz
             if (camId.isBlank() && opts.isNotEmpty()) camId = opts.first().cameraId
-            delay(1000)
+            delay(500)
         }
     }
 
@@ -298,13 +360,101 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             val fpsRange =
                 opt?.aeFpsRanges?.firstOrNull { r -> "${r.lower}-${r.upper}" == camFpsText }
                     ?: opt?.aeFpsRanges?.firstOrNull()
+            val sensorOrient = opt?.sensorOrientationDeg ?: 0
+            val rot = context.display?.rotation ?: Surface.ROTATION_0
+            val devDeg =
+                when (rot) {
+                    Surface.ROTATION_0 -> 0
+                    Surface.ROTATION_90 -> 90
+                    Surface.ROTATION_180 -> 180
+                    Surface.ROTATION_270 -> 270
+                    else -> 0
+                }
+            val rotationDegrees = (sensorOrient - devDeg + 360) % 360
             if (size != null) {
+                camCtrl.onFrame =
+                    frame@{ image: Image, rotDeg: Int ->
+                        val lib = visionLib
+                        val task = visionTask
+                        if (lib == VisionLibrary.NONE || task == VisionTask.NONE) {
+                            runCatching { image.close() }
+                            return@frame
+                        }
+
+                        if (lib != VisionLibrary.MLKIT) {
+                            visionNote = "MediaPipe not enabled yet (needs .task models in assets)"
+                            runCatching { image.close() }
+                            return@frame
+                        }
+
+                        if (task != VisionTask.FACE) {
+                            visionNote = "ML Kit task ${task.name} not implemented yet (FACE works)"
+                            runCatching { image.close() }
+                            return@frame
+                        }
+
+                        if (!visionBusy.compareAndSet(false, true)) {
+                            runCatching { image.close() }
+                            return@frame
+                        }
+
+                        val detector =
+                            faceDetectorRef.get()
+                                ?: FaceDetection.getClient(
+                                    FaceDetectorOptions.Builder()
+                                        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                                        .build()
+                                ).also { faceDetectorRef.set(it) }
+
+                        val input = InputImage.fromMediaImage(image, rotDeg)
+                        detector.process(input)
+                            .addOnSuccessListener { faces: List<Face> ->
+                                val (iw, ih) =
+                                    if (rotDeg == 90 || rotDeg == 270) {
+                                        image.height to image.width
+                                    } else {
+                                        image.width to image.height
+                                    }
+                                val boxes =
+                                    faces.mapNotNull { f ->
+                                        val r: Rect = f.boundingBox
+                                        if (iw <= 0 || ih <= 0) return@mapNotNull null
+                                        NormRect(
+                                            left = (r.left.toFloat() / iw.toFloat()).coerceIn(0f, 1f),
+                                            top = (r.top.toFloat() / ih.toFloat()).coerceIn(0f, 1f),
+                                            right = (r.right.toFloat() / iw.toFloat()).coerceIn(0f, 1f),
+                                            bottom = (r.bottom.toFloat() / ih.toFloat()).coerceIn(0f, 1f),
+                                        )
+                                    }
+                                val nowNs = System.nanoTime()
+                                val hz = visionRate.update(nowNs)
+                                visionOverlayRef.set(
+                                    VisionOverlayState(
+                                        imageWidth = iw,
+                                        imageHeight = ih,
+                                        boxes = boxes,
+                                        label = "faces=${faces.size}",
+                                        procHz = hz,
+                                    )
+                                )
+                                visionNote = null
+                            }
+                            .addOnFailureListener { e ->
+                                visionNote = "ML Kit face failed: ${e.message ?: e::class.java.simpleName}"
+                            }
+                            .addOnCompleteListener {
+                                visionBusy.set(false)
+                                runCatching { image.close() }
+                            }
+                    }
                 camCtrl.startPreview(
                     tv,
                     CameraTestingController.StartConfig(
                         cameraId = camId,
                         targetSize = size,
                         targetFpsRange = fpsRange,
+                        rotationDegrees = rotationDegrees,
+                        enableAnalysis = true,
                     )
                 )
             }
@@ -347,6 +497,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     )
             }
             swingOfferHz = swingOfferHzRef.get()
+            visionOverlayUi = visionOverlayRef.get()
             delay(50) // ~20 Hz
         }
     }
@@ -463,6 +614,27 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     onSelect = { camResText = it },
                 )
 
+                val libOptions = listOf(VisionLibrary.NONE, VisionLibrary.MLKIT, VisionLibrary.MEDIAPIPE)
+                val taskOptions =
+                    when (visionLib) {
+                        VisionLibrary.NONE -> listOf(VisionTask.NONE)
+                        VisionLibrary.MLKIT -> listOf(VisionTask.NONE, VisionTask.FACE, VisionTask.POSE, VisionTask.OBJECT)
+                        VisionLibrary.MEDIAPIPE -> listOf(VisionTask.NONE, VisionTask.FACE, VisionTask.POSE, VisionTask.OBJECT, VisionTask.HAND)
+                    }
+                DropdownSelector(
+                    label = "Vision library",
+                    value = visionLib.name,
+                    options = libOptions.map { it.name },
+                    onSelect = { visionLib = runCatching { VisionLibrary.valueOf(it) }.getOrDefault(VisionLibrary.NONE); visionTask = VisionTask.NONE },
+                )
+                DropdownSelector(
+                    label = "Vision task",
+                    value = visionTask.name,
+                    options = taskOptions.map { it.name },
+                    enabled = visionLib != VisionLibrary.NONE,
+                    onSelect = { visionTask = runCatching { VisionTask.valueOf(it) }.getOrDefault(VisionTask.NONE) },
+                )
+
                 SectionTitle("Camera preview")
                 val selectedSize =
                     selected?.previewSizes?.firstOrNull { s -> "${s.width}x${s.height}" == camResText }
@@ -478,7 +650,17 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                         factory = { ctx -> TextureView(ctx).also { camTextureView = it } },
                         modifier = Modifier.fillMaxSize(),
                     )
+                    VisionOverlay(overlay = visionOverlayUi)
                 }
+
+                MonoBlock(
+                    lines =
+                        listOf(
+                            formatHz("visionHz(Hz)", visionOverlayUi?.procHz),
+                            "vision label : ${visionOverlayUi?.label ?: "?"}",
+                            "vision note  : ${visionNote ?: "OK"}",
+                        ),
+                )
 
                 MonoBlock(
                     lines =

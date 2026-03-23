@@ -51,6 +51,12 @@ dependencies {
     // USB-Serial (USB-C -> USB to Serial adapters like FTDI/CH340/CP210x)
     implementation("com.github.mik3y:usb-serial-for-android:3.8.1")
 
+    // Vision / detection
+    implementation("com.google.mlkit:face-detection:16.1.7")
+    implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
+    implementation("com.google.mlkit:object-detection:17.0.2")
+    implementation("com.google.mediapipe:tasks-vision:0.10.32")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
