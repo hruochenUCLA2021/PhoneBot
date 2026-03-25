@@ -10,3 +10,6 @@
 **/*.pyc
 
 copy_repo
+
+
+/AI_backend/voices/**

@@ -259,3 +259,21 @@ ros2 topic echo /phonebot/battery --once
 source install/setup.bash
 ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp  --ros-args -p android_ip:=192.168.20.21
 ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp  --ros-args -p android_ip:=192.168.20.31
+
+
+
+
+to test the ai backend::::
+(RL_env_3_12) hrc@hrc-Nitro-ANV15-51:~$ curl -s -X POST http://127.0.0.1:8088/api/llm/text   -H "Content-Type: application/json"   -d '{"text":"hello"}'
+{"transcript":"hello","reply":"Hello! How can I assist you today with your robotics project?"}(RL_env_3_12) hrc@hrc-Nitro-ANV15-51:~$ ^C
+(RL_env_3_12) hrc@hrc-Nitro-ANV15-51:~$ 
+
+
+
+(RL_env_3_12) hrc@hrc-Nitro-ANV15-51:/media/hrc/T7_UBUNTU_ONLY/android_humanoid_all_files/PhoneBot/AI_backend$ python ./server.py 
+INFO:     Started server process [711244]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8088 (Press CTRL+C to quit)
+INFO:     127.0.0.1:33854 - "POST /api/llm/text HTTP/1.1" 200 OK
+

@@ -3,6 +3,15 @@ package com.example.phonebot_app_android
 import android.Manifest
 import android.os.Bundle
 import android.content.pm.PackageManager
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.speech.tts.TextToSpeech
+import android.os.Handler
+import android.os.Looper
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.LocaleSpan
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -78,6 +87,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
@@ -125,9 +135,15 @@ import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 
+// LLM page helpers
+import com.example.phonebot_app_android.llm.LlmHttpClient
+import com.example.phonebot_app_android.llm.PiperVoice
+import com.example.phonebot_app_android.llm.WavAudioRecorder
+
 enum class VisionLibrary { NONE, MLKIT, MEDIAPIPE }
 enum class VisionTask { NONE, FACE, POSE, OBJECT, HAND, GESTURE }
 enum class MediaPipePoseModel { LITE, FULL, HEAVY }
+private enum class TtsMode { ANDROID, PC_PIPER }
 
 private data class NormRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
 private data class NormPoint(val x: Float, val y: Float)
@@ -330,7 +346,30 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val swingFutureRef = remember { AtomicReference<ScheduledFuture<*>?>(null) }
 
     // Page selection
-    var page by rememberSaveable { mutableStateOf(0) } // 0=dashboard, 1=camera testing
+    var page by rememberSaveable { mutableStateOf(0) } // 0=dashboard, 1=camera testing, 2=llm
+
+    // LLM page
+    var llmHost by rememberSaveable { mutableStateOf("192.168.20.15") }
+    var llmPortText by rememberSaveable { mutableStateOf("8088") }
+    var llmText by rememberSaveable { mutableStateOf("") }
+    var llmWhisperModel by rememberSaveable { mutableStateOf("base") }
+    var llmWhisperLang by rememberSaveable { mutableStateOf("en") }
+    var llmStatus by remember { mutableStateOf<String?>(null) }
+    var llmTranscript by remember { mutableStateOf<String?>(null) }
+    var llmReply by remember { mutableStateOf<String?>(null) }
+    var llmRecording by remember { mutableStateOf(false) }
+    val llmRecorder = remember { WavAudioRecorder(sampleRateHz = 16000) }
+    val llmLastWavRef = remember { AtomicReference<java.io.File?>(null) }
+    val llmExecRef = remember { AtomicReference<java.util.concurrent.ExecutorService?>(null) }
+    val ttsRef = remember { AtomicReference<TextToSpeech?>(null) }
+    var ttsLangTag by rememberSaveable { mutableStateOf("en-US") }
+    var ttsLangStatus by remember { mutableStateOf<String?>(null) }
+    var ttsMode by rememberSaveable { mutableStateOf(TtsMode.ANDROID) }
+    var piperVoices by remember { mutableStateOf<List<PiperVoice>>(emptyList()) }
+    var piperVoiceId by rememberSaveable { mutableStateOf<String?>(null) }
+    var piperStatus by remember { mutableStateOf<String?>(null) }
+    val piperLastWavRef = remember { AtomicReference<java.io.File?>(null) }
+    val mediaPlayerRef = remember { AtomicReference<MediaPlayer?>(null) }
 
     // Camera testing page
     val camCtrl = remember { CameraTestingController(context) }
@@ -409,6 +448,14 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             udpReceiver.stop()
             camProviderRef.getAndSet(null)?.unbindAll()
             camAnalysisExecRef.getAndSet(null)?.shutdownNow()
+            llmExecRef.getAndSet(null)?.shutdownNow()
+            runCatching { ttsRef.getAndSet(null)?.shutdown() }
+            runCatching {
+                mediaPlayerRef.getAndSet(null)?.let {
+                    runCatching { it.stop() }
+                    it.release()
+                }
+            }
             runCatching { faceDetectorRef.getAndSet(null)?.close() }
             runCatching { poseDetectorRef.getAndSet(null)?.close() }
             runCatching { objectDetectorRef.getAndSet(null)?.close() }
@@ -418,6 +465,31 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             runCatching { mpGestureRef.getAndSet(null)?.close() }
             camCtrl.stop()
         }
+    }
+
+    // Init Android TTS (for LLM page).
+    DisposableEffect(Unit) {
+        val mainHandler = Handler(Looper.getMainLooper())
+        lateinit var tts: TextToSpeech
+        tts =
+            TextToSpeech(context) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    val msg = applyTtsLanguage(tts, ttsLangTag)
+                    mainHandler.post { ttsLangStatus = msg }
+                } else {
+                    mainHandler.post { ttsLangStatus = "TTS init failed: $status" }
+                }
+            }
+        ttsRef.set(tts)
+        onDispose {
+            runCatching { tts.shutdown() }
+            if (ttsRef.get() === tts) ttsRef.set(null)
+        }
+    }
+
+    LaunchedEffect(ttsLangTag) {
+        val tts = ttsRef.get() ?: return@LaunchedEffect
+        ttsLangStatus = applyTtsLanguage(tts, ttsLangTag)
     }
 
     // Refresh camera info at ~2Hz while on camera page.
@@ -1276,9 +1348,364 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { page = 0 }) { Text("Dashboard") }
                 Button(onClick = { page = 1 }) { Text("Camera testing") }
+                Button(onClick = { page = 2 }) { Text("LLM") }
             }
 
-            if (page == 1) {
+            if (page == 2) {
+                SectionTitle("LLM / GPT page")
+
+                val audioGranted =
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                        PackageManager.PERMISSION_GRANTED
+                val audioLauncher =
+                    rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                        // no-op; UI will reflect state
+                    }
+
+                val phoneIp = getLocalIpv4Address() ?: "?"
+                val baseUrl =
+                    run {
+                        val p = llmPortText.toIntOrNull()
+                        if (p == null || p !in 1..65535) null else "http://${llmHost}:${p}"
+                    }
+
+                LaunchedEffect(ttsMode, ttsLangTag, baseUrl) {
+                    if (ttsMode != TtsMode.PC_PIPER) return@LaunchedEffect
+                    val url = baseUrl ?: return@LaunchedEffect
+                    piperStatus = "Fetching Piper voices..."
+                    try {
+                        val voices =
+                            withContext(Dispatchers.IO) {
+                                LlmHttpClient.getPiperVoices(url, ttsLangTag)
+                            }
+                        piperVoices = voices
+                        if (piperVoiceId.isNullOrBlank() && voices.isNotEmpty()) {
+                            piperVoiceId = voices.first().voiceId
+                        }
+                        piperStatus = "Piper voices: ${voices.size}"
+                    } catch (e: Throwable) {
+                        piperVoices = emptyList()
+                        piperStatus = "Piper voices failed: ${e.message}"
+                    }
+                }
+
+                MonoBlock(
+                    lines =
+                        listOf(
+                            "phone ip      : $phoneIp",
+                            "backend url   : ${baseUrl ?: "(invalid host/port)"}",
+                            "audio perm    : ${if (audioGranted) "GRANTED" else "MISSING"}",
+                            "recording     : $llmRecording",
+                            "whisper model : $llmWhisperModel",
+                            "whisper lang  : $llmWhisperLang",
+                            "status        : ${llmStatus ?: "OK"}",
+                            "tts lang      : $ttsLangTag",
+                            "tts status    : ${ttsLangStatus ?: ""}",
+                            "tts mode      : $ttsMode",
+                            "piper status  : ${piperStatus ?: ""}",
+                            "piper voice   : ${piperVoiceId ?: ""}",
+                        ),
+                )
+
+                val ttsLangOptions =
+                    listOf(
+                        "en-US",
+                        "en-GB",
+                        "zh-CN",
+                        "zh-TW",
+                        "ja-JP",
+                        "ko-KR",
+                    )
+                var ttsLangMenuOpen by remember { mutableStateOf(false) }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { ttsLangMenuOpen = true }) {
+                        Text("TTS language: $ttsLangTag")
+                    }
+                    DropdownMenu(expanded = ttsLangMenuOpen, onDismissRequest = { ttsLangMenuOpen = false }) {
+                        ttsLangOptions.forEach { tag ->
+                            DropdownMenuItem(
+                                text = { Text(tag) },
+                                onClick = {
+                                    ttsLangTag = tag
+                                    ttsLangMenuOpen = false
+                                },
+                            )
+                        }
+                    }
+                }
+
+                val ttsModeOptions = listOf(TtsMode.ANDROID, TtsMode.PC_PIPER)
+                var ttsModeMenuOpen by remember { mutableStateOf(false) }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { ttsModeMenuOpen = true }) {
+                        Text("TTS mode: $ttsMode")
+                    }
+                    DropdownMenu(expanded = ttsModeMenuOpen, onDismissRequest = { ttsModeMenuOpen = false }) {
+                        ttsModeOptions.forEach { m ->
+                            DropdownMenuItem(
+                                text = { Text(m.name) },
+                                onClick = {
+                                    ttsMode = m
+                                    ttsModeMenuOpen = false
+                                },
+                            )
+                        }
+                    }
+                }
+
+                if (ttsMode == TtsMode.PC_PIPER) {
+                    var piperVoiceMenuOpen by remember { mutableStateOf(false) }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { piperVoiceMenuOpen = true },
+                            enabled = piperVoices.isNotEmpty(),
+                        ) {
+                            val label =
+                                piperVoices.firstOrNull { it.voiceId == piperVoiceId }?.label
+                                    ?: (piperVoiceId ?: "(none)")
+                            Text("Piper voice: $label")
+                        }
+                        DropdownMenu(
+                            expanded = piperVoiceMenuOpen,
+                            onDismissRequest = { piperVoiceMenuOpen = false },
+                        ) {
+                            piperVoices.forEach { v ->
+                                DropdownMenuItem(
+                                    text = { Text(v.label) },
+                                    onClick = {
+                                        piperVoiceId = v.voiceId
+                                        piperVoiceMenuOpen = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = llmHost,
+                        onValueChange = { llmHost = it },
+                        label = { Text("AI backend IP / Host") },
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = llmPortText,
+                        onValueChange = { llmPortText = it.filter { c -> c.isDigit() }.take(5) },
+                        label = { Text("Port") },
+                        singleLine = true,
+                    )
+                }
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = llmWhisperModel,
+                        onValueChange = { llmWhisperModel = it.trim() },
+                        label = { Text("Whisper model (base/small.en/...)") },
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = llmWhisperLang,
+                        onValueChange = { llmWhisperLang = it.trim().ifBlank { "en" } },
+                        label = { Text("Whisper language (en/auto)") },
+                        singleLine = true,
+                    )
+                }
+
+                OutlinedTextField(
+                    modifier = Modifier.fillMaxWidth(),
+                    value = llmText,
+                    onValueChange = { llmText = it },
+                    label = { Text("Text to send") },
+                )
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            if (!audioGranted) {
+                                audioLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                return@Button
+                            }
+                            val wav = java.io.File(context.cacheDir, "llm_record.wav")
+                            if (!llmRecording) {
+                                llmStatus = "Recording..."
+                                llmTranscript = null
+                                llmReply = null
+                                llmRecorder.start(wav)
+                                llmLastWavRef.set(wav)
+                                llmRecording = true
+                            } else {
+                                llmRecorder.stop()
+                                llmRecording = false
+                                llmStatus = "Recorded: ${wav.name} (${wav.length()} bytes)"
+                            }
+                        },
+                    ) { Text(if (llmRecording) "Stop Rec" else "Record") }
+
+                    Button(
+                        onClick = {
+                            val url = baseUrl ?: run { llmStatus = "Invalid backend url"; return@Button }
+                            val exec =
+                                llmExecRef.get()
+                                    ?: Executors.newSingleThreadExecutor().also { llmExecRef.set(it) }
+                            llmStatus = "Sending text..."
+                            exec.execute {
+                                try {
+                                    val resp = LlmHttpClient.postText(url, llmText)
+                                    val main = Handler(Looper.getMainLooper())
+                                    var piperWav: java.io.File? = null
+                                    if (ttsMode == TtsMode.PC_PIPER) {
+                                        main.post { llmStatus = "Piper TTS..." }
+                                        val wavBytes =
+                                            LlmHttpClient.postPiperTts(
+                                                baseUrl = url,
+                                                text = resp.reply,
+                                                langTag = ttsLangTag,
+                                                voiceId = piperVoiceId,
+                                            )
+                                        val f = java.io.File(context.cacheDir, "piper_tts.wav")
+                                        f.writeBytes(wavBytes)
+                                        piperLastWavRef.set(f)
+                                        piperWav = f
+                                    }
+
+                                    main.post {
+                                        llmTranscript = resp.transcript
+                                        llmReply = resp.reply
+                                        llmStatus = "OK"
+                                        if (ttsMode == TtsMode.ANDROID) {
+                                            val tts = ttsRef.get()
+                                            if (tts != null) {
+                                                speakWithLocale(
+                                                    tts = tts,
+                                                    text = resp.reply,
+                                                    langTag = ttsLangTag,
+                                                    utteranceId = "llm_reply_${System.nanoTime()}",
+                                                )
+                                            }
+                                        } else if (piperWav != null) {
+                                            playWavFile(context, piperWav!!, mediaPlayerRef)
+                                        }
+                                    }
+                                } catch (e: Throwable) {
+                                    Handler(Looper.getMainLooper()).post { llmStatus = "Text failed: ${e.message}" }
+                                }
+                            }
+                        },
+                        enabled = baseUrl != null,
+                    ) { Text("Send Text") }
+
+                    Button(
+                        onClick = {
+                            val url = baseUrl ?: run { llmStatus = "Invalid backend url"; return@Button }
+                            val wav = llmLastWavRef.get()
+                            if (wav == null || !wav.exists() || wav.length() <= 44) {
+                                llmStatus = "No WAV recorded yet"
+                                return@Button
+                            }
+                            val exec =
+                                llmExecRef.get()
+                                    ?: Executors.newSingleThreadExecutor().also { llmExecRef.set(it) }
+                            llmStatus = "Sending audio..."
+                            exec.execute {
+                                try {
+                                    val resp =
+                                        LlmHttpClient.postAudio(
+                                            baseUrl = url,
+                                            wavFile = wav,
+                                            whisperModel = llmWhisperModel,
+                                            whisperLanguage = llmWhisperLang,
+                                        )
+                                    val main = Handler(Looper.getMainLooper())
+                                    var piperWav: java.io.File? = null
+                                    if (ttsMode == TtsMode.PC_PIPER) {
+                                        main.post { llmStatus = "Piper TTS..." }
+                                        val wavBytes =
+                                            LlmHttpClient.postPiperTts(
+                                                baseUrl = url,
+                                                text = resp.reply,
+                                                langTag = ttsLangTag,
+                                                voiceId = piperVoiceId,
+                                            )
+                                        val f = java.io.File(context.cacheDir, "piper_tts.wav")
+                                        f.writeBytes(wavBytes)
+                                        piperLastWavRef.set(f)
+                                        piperWav = f
+                                    }
+
+                                    main.post {
+                                        llmTranscript = resp.transcript
+                                        llmReply = resp.reply
+                                        llmStatus = "OK"
+                                        if (ttsMode == TtsMode.ANDROID) {
+                                            val tts = ttsRef.get()
+                                            if (tts != null) {
+                                                speakWithLocale(
+                                                    tts = tts,
+                                                    text = resp.reply,
+                                                    langTag = ttsLangTag,
+                                                    utteranceId = "llm_reply_${System.nanoTime()}",
+                                                )
+                                            }
+                                        } else if (piperWav != null) {
+                                            playWavFile(context, piperWav!!, mediaPlayerRef)
+                                        }
+                                    }
+                                } catch (e: Throwable) {
+                                    Handler(Looper.getMainLooper()).post { llmStatus = "Audio failed: ${e.message}" }
+                                }
+                            }
+                        },
+                        enabled = baseUrl != null,
+                    ) { Text("Send Audio") }
+                }
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            val reply = llmReply
+                            if (reply.isNullOrBlank()) {
+                                llmStatus = "No reply to replay yet"
+                                return@Button
+                            }
+                            if (ttsMode == TtsMode.ANDROID) {
+                                val tts = ttsRef.get()
+                                if (tts == null) {
+                                    llmStatus = "TTS not ready"
+                                    return@Button
+                                }
+                                speakWithLocale(
+                                    tts = tts,
+                                    text = reply,
+                                    langTag = ttsLangTag,
+                                    utteranceId = "llm_reply_replay_${System.nanoTime()}",
+                                )
+                            } else {
+                                val f = piperLastWavRef.get()
+                                if (f != null && f.exists() && f.length() > 44) {
+                                    playWavFile(context, f, mediaPlayerRef)
+                                } else {
+                                    llmStatus = "No Piper audio yet (send once first)"
+                                }
+                            }
+                        },
+                        enabled = llmReply != null,
+                    ) { Text("Replay") }
+                }
+
+                MonoBlock(
+                    lines =
+                        listOf(
+                            "transcript : ${llmTranscript ?: ""}",
+                            "reply      : ${llmReply ?: ""}",
+                        ),
+                )
+
+            } else if (page == 1) {
                 SectionTitle("Camera testing page")
 
                 val camGranted =
@@ -1650,6 +2077,77 @@ private fun formatVec3(name: String, v: FloatArray?): String {
 private fun formatHz(name: String, hz: Float?): String {
     if (hz == null) return "${name.padEnd(12)}: ?"
     return "${name.padEnd(12)}: ${hz.fmt()} Hz"
+}
+
+private fun applyTtsLanguage(tts: TextToSpeech, langTag: String): String {
+    val locale = Locale.forLanguageTag(langTag.ifBlank { "en-US" })
+    val res =
+        runCatching { tts.setLanguage(locale) }
+            .getOrElse { return "setLanguage failed: ${it.javaClass.simpleName}: ${it.message}" }
+    return when (res) {
+        TextToSpeech.LANG_MISSING_DATA -> "setLanguage($langTag): MISSING_DATA"
+        TextToSpeech.LANG_NOT_SUPPORTED -> "setLanguage($langTag): NOT_SUPPORTED"
+        TextToSpeech.LANG_AVAILABLE -> "setLanguage($langTag): OK (LANG_AVAILABLE)"
+        TextToSpeech.LANG_COUNTRY_AVAILABLE -> "setLanguage($langTag): OK (LANG_COUNTRY_AVAILABLE)"
+        TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE -> "setLanguage($langTag): OK (LANG_COUNTRY_VAR_AVAILABLE)"
+        else -> "setLanguage($langTag): OK (code=$res)"
+    }
+}
+
+private fun preprocessForTts(text: String): String {
+    // Only used for speech output; keep it conservative to avoid changing meaning.
+    val replaced =
+        text
+            .replace("\r\n", "\n")
+            .replace("\n", ". ")
+            .replace("*", " star ")
+            .replace("#", " hash ")
+            .replace("_", " underscore ")
+            .replace("/", " slash ")
+            .replace("\\", " backslash ")
+    return replaced.replace(Regex("\\s+"), " ").trim()
+}
+
+private fun speakWithLocale(tts: TextToSpeech, text: String, langTag: String, utteranceId: String) {
+    val locale = Locale.forLanguageTag(langTag.ifBlank { "en-US" })
+    val processed = preprocessForTts(text)
+    val sp = SpannableString(processed)
+    sp.setSpan(LocaleSpan(locale), 0, sp.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    runCatching {
+        tts.speak(sp, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+    }
+}
+
+private fun playWavFile(context: Context, wavFile: java.io.File, playerRef: AtomicReference<MediaPlayer?>) {
+    if (!wavFile.exists() || wavFile.length() <= 44) return
+    runCatching {
+        playerRef.getAndSet(null)?.let {
+            runCatching { it.stop() }
+            it.release()
+        }
+    }
+    val mp = MediaPlayer()
+    runCatching {
+        mp.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build(),
+        )
+    }
+    mp.setDataSource(wavFile.absolutePath)
+    mp.setOnCompletionListener { p ->
+        playerRef.compareAndSet(p, null)
+        p.release()
+    }
+    mp.setOnErrorListener { p, _, _ ->
+        playerRef.compareAndSet(p, null)
+        runCatching { p.release() }
+        true
+    }
+    mp.prepare()
+    mp.start()
+    playerRef.set(mp)
 }
 
 private fun Float.fmt(): String = "% .4f".format(this)
