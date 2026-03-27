@@ -27,6 +27,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import com.airbnb.lottie.compose.LottieAnimation
+import com.airbnb.lottie.compose.LottieCompositionSpec
+import com.airbnb.lottie.compose.animateLottieCompositionAsState
+import com.airbnb.lottie.compose.rememberLottieComposition
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -39,6 +43,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -346,7 +351,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val swingFutureRef = remember { AtomicReference<ScheduledFuture<*>?>(null) }
 
     // Page selection
-    var page by rememberSaveable { mutableStateOf(0) } // 0=dashboard, 1=camera testing, 2=llm
+    var page by rememberSaveable { mutableStateOf(0) } // 0=dashboard, 1=camera, 2=llm, 3=animation
 
     // LLM page
     var llmHost by rememberSaveable { mutableStateOf("192.168.20.15") }
@@ -370,6 +375,23 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     var piperStatus by remember { mutableStateOf<String?>(null) }
     val piperLastWavRef = remember { AtomicReference<java.io.File?>(null) }
     val mediaPlayerRef = remember { AtomicReference<MediaPlayer?>(null) }
+
+    // Animation page (Lottie assets under assets/lottle_animations/)
+    var lottieSelectedFile by rememberSaveable { mutableStateOf("") }
+    var lottiePlayNonce by remember { mutableStateOf(0) }
+    val lottieAssetFiles =
+        remember {
+            runCatching {
+                context.assets
+                    .list("lottle_animations")
+                    ?.filter { f ->
+                        f.endsWith(".lottie", ignoreCase = true) ||
+                            f.endsWith(".json", ignoreCase = true)
+                    }
+                    ?.sorted()
+                    ?: emptyList()
+            }.getOrDefault(emptyList())
+        }
 
     // Camera testing page
     val camCtrl = remember { CameraTestingController(context) }
@@ -1350,8 +1372,73 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                 Button(onClick = { page = 1 }) { Text("Camera testing") }
                 Button(onClick = { page = 2 }) { Text("LLM") }
             }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { page = 3 }) { Text("Animation") }
+            }
 
-            if (page == 2) {
+            LaunchedEffect(lottieAssetFiles) {
+                if (lottieSelectedFile.isBlank() && lottieAssetFiles.isNotEmpty()) {
+                    lottieSelectedFile = lottieAssetFiles.first()
+                }
+            }
+
+            if (page == 3) {
+                SectionTitle("Animation (Lottie)")
+
+                MonoBlock(
+                    lines =
+                        listOf(
+                            "assets folder : lottle_animations/",
+                            "files found   : ${lottieAssetFiles.size}",
+                            "selected      : ${lottieSelectedFile.ifBlank { "(none)" }}",
+                        ),
+                )
+
+                if (lottieAssetFiles.isEmpty()) {
+                    Text("No .lottie or .json files in assets/lottle_animations/. Add files and rebuild.")
+                } else {
+                    DropdownSelector(
+                        label = "Animation",
+                        value = lottieSelectedFile,
+                        options = lottieAssetFiles,
+                        onSelect = {
+                            lottieSelectedFile = it
+                            lottiePlayNonce = 0
+                        },
+                    )
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { lottiePlayNonce++ },
+                            enabled = lottieSelectedFile.isNotBlank(),
+                        ) { Text("Play") }
+                    }
+
+                    val assetPath = "lottle_animations/$lottieSelectedFile"
+                    key(lottiePlayNonce, lottieSelectedFile) {
+                        val composition by rememberLottieComposition(LottieCompositionSpec.Asset(assetPath))
+                        val progress by
+                            animateLottieCompositionAsState(
+                                composition = composition,
+                                isPlaying = lottiePlayNonce > 0,
+                                iterations = 1,
+                            )
+                        Box(
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(320.dp)
+                                    .background(Color.Black),
+                        ) {
+                            LottieAnimation(
+                                composition = composition,
+                                progress = { progress },
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                    }
+                }
+            } else if (page == 2) {
                 SectionTitle("LLM / GPT page")
 
                 val audioGranted =

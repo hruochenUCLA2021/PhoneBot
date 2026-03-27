@@ -79,7 +79,7 @@ def _quat_from_axis_angle_z(theta):
 #
 # Quaternion (wxyz): [0, 0, sqrt2/2, sqrt2/2]
 _s = np.sqrt(2.0) / 2.0
-Q_PHONE_TO_BASE = np.array([0.0, 0.0, _s, _s])
+Q_PHONE_TO_TRUNK = np.array([0.0, 0.0, _s, _s])
 
 # IMU site orientation relative to trunk_link body frame (from XML).
 # <site name="imu" quat="0.707107 0.000000 0.000000 0.707107"/>  -> 90 deg about Z
@@ -144,8 +144,8 @@ class PhonebotVisualizer(Node):
         # ROS Quaternion is (x, y, z, w) -> convert to [w,x,y,z]
         q_phone = np.array([q.w, q.x, q.y, q.z])
         # Phone is mounted on trunk. Convert phone body frame to trunk/base body frame.
-        # q_trunk_in_world = q_phone_in_world * Q_PHONE_TO_BASE
-        self._q_trunk[:] = _quat_mul(q_phone, Q_PHONE_TO_BASE)
+        # q_trunk_in_world = q_phone_in_world * Q_PHONE_TO_TRUNK
+        self._q_trunk[:] = _quat_mul(q_phone, Q_PHONE_TO_TRUNK)
 
     def _on_motor_state(self, msg: JointState):
         n = min(NUM_JOINTS, len(msg.position))

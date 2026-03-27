@@ -1,3 +1,9 @@
+install piper:
+pip install piper-tts
+
+
+
+to download data or model on hugging face:
 pip install huggingface_hub
 
 

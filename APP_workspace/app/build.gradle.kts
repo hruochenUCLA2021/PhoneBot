@@ -57,6 +57,9 @@ dependencies {
     implementation("com.google.mlkit:object-detection:17.0.2")
     implementation("com.google.mediapipe:tasks-vision:0.10.32")
 
+    // Lottie (Compose) — supports JSON and .lottie (dotLottie) in recent versions
+    implementation("com.airbnb.android:lottie-compose:6.6.6")
+
     // CameraX (stable)
     val cameraxVersion = "1.5.3"
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
