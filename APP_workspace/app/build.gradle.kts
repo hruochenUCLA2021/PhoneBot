@@ -60,6 +60,9 @@ dependencies {
     // Lottie (Compose) — supports JSON and .lottie (dotLottie) in recent versions
     implementation("com.airbnb.android:lottie-compose:6.6.6")
 
+    // TensorFlow Lite (on-device policy inference)
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+
     // CameraX (stable)
     val cameraxVersion = "1.5.3"
     implementation("androidx.camera:camera-camera2:$cameraxVersion")

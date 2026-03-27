@@ -144,6 +144,9 @@ import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.example.phonebot_app_android.llm.LlmHttpClient
 import com.example.phonebot_app_android.llm.PiperVoice
 import com.example.phonebot_app_android.llm.WavAudioRecorder
+import com.example.phonebot_app_android.policy.PhonebotPolicyAssets
+import com.example.phonebot_app_android.policy.PolicyAsset
+import com.example.phonebot_app_android.policy.TfliteActor
 
 enum class VisionLibrary { NONE, MLKIT, MEDIAPIPE }
 enum class VisionTask { NONE, FACE, POSE, OBJECT, HAND, GESTURE }
@@ -350,6 +353,28 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val swingExecRef = remember { AtomicReference<ScheduledExecutorService?>(null) }
     val swingFutureRef = remember { AtomicReference<ScheduledFuture<*>?>(null) }
 
+    // Locomotion policy (on-phone inference -> UDP motor cmd)
+    val policyOptions: List<PolicyAsset> =
+        remember {
+            runCatching { PhonebotPolicyAssets.listAvailablePolicies(context) }.getOrDefault(emptyList())
+        }
+    var policySelected by rememberSaveable { mutableStateOf("") } // selected tflite filename
+    var policyOn by remember { mutableStateOf(false) }
+    var policyHzText by rememberSaveable { mutableStateOf("50") }
+    var policyOfferHz by remember { mutableStateOf<Float?>(null) }
+    val policyOfferHzRef = remember { AtomicReference<Float?>(null) }
+    val policyExecRef = remember { AtomicReference<ScheduledExecutorService?>(null) }
+    val policyFutureRef = remember { AtomicReference<ScheduledFuture<*>?>(null) }
+    val policyActorRef = remember { AtomicReference<TfliteActor?>(null) }
+    val latestPolicyActionRef = remember { AtomicReference<FloatArray?>(null) }
+    val latestPolicyTargetRef = remember { AtomicReference<FloatArray?>(null) }
+    val latestImuRawRef = remember { AtomicReference<ImuState?>(null) }
+    var policyActionUi by remember { mutableStateOf<FloatArray?>(null) }
+    var policyTargetUi by remember { mutableStateOf<FloatArray?>(null) }
+    var cmdVxText by rememberSaveable { mutableStateOf("0.0") }
+    var cmdVyText by rememberSaveable { mutableStateOf("0.0") }
+    var cmdWzText by rememberSaveable { mutableStateOf("0.0") }
+
     // Page selection
     var page by rememberSaveable { mutableStateOf(0) } // 0=dashboard, 1=camera, 2=llm, 3=animation
 
@@ -441,6 +466,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
 
         imuMonitor.onUiUpdate = { imu = it }
         imuMonitor.onRawUpdate = { sample ->
+            latestImuRawRef.set(sample)
             if (udpEnabled) {
                 val seq = sensorSeq.incrementAndGet()
                 val payload =
@@ -472,6 +498,9 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             camAnalysisExecRef.getAndSet(null)?.shutdownNow()
             llmExecRef.getAndSet(null)?.shutdownNow()
             runCatching { ttsRef.getAndSet(null)?.shutdown() }
+            policyFutureRef.getAndSet(null)?.cancel(false)
+            policyExecRef.getAndSet(null)?.shutdownNow()
+            runCatching { policyActorRef.getAndSet(null)?.close() }
             runCatching {
                 mediaPlayerRef.getAndSet(null)?.let {
                     runCatching { it.stop() }
@@ -1310,6 +1339,9 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     )
             }
             swingOfferHz = swingOfferHzRef.get()
+            policyOfferHz = policyOfferHzRef.get()
+            policyActionUi = latestPolicyActionRef.get()
+            policyTargetUi = latestPolicyTargetRef.get()
             camPreviewFps = camPreviewFpsRef.get()
             visionOverlayUi = visionOverlayRef.get()
             visionNote = visionNoteRef.get()
@@ -1987,6 +2019,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                 lines =
                     listOf(
                         formatHz("swingOffer(Hz)", swingOfferHz),
+                        formatHz("policyOffer(Hz)", policyOfferHz),
                         "ctrlSend(Hz) : ${udpCtrlSender.lastSendHz?.let { "%.1f".format(it) } ?: "?"} Hz (sender thread)",
                     ),
             )
@@ -2032,6 +2065,193 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     onClick = { testSwingOn = !testSwingOn },
                     enabled = udpEnabled,
                 ) { Text(if (testSwingOn) "Test swing: ON" else "Test swing: OFF") }
+            }
+
+            SectionTitle("Locomotion policy (on-phone TFLite → motor UDP)")
+            MonoBlock(
+                lines =
+                    listOf(
+                        "policies found: ${policyOptions.size}",
+                        "selected      : ${policySelected.ifBlank { "(none)" }}",
+                        "mode          : ${
+                            policyOptions.firstOrNull { it.tfliteFile == policySelected }?.mode ?: "?"
+                        }",
+                        "env           : ${
+                            policyOptions.firstOrNull { it.tfliteFile == policySelected }?.meta?.envName ?: "?"
+                        }",
+                    ),
+            )
+
+            LaunchedEffect(policyOptions) {
+                if (policySelected.isBlank() && policyOptions.isNotEmpty()) {
+                    policySelected = policyOptions.first().tfliteFile
+                }
+            }
+
+            DropdownSelector(
+                label = "Policy model (.tflite)",
+                value = policySelected,
+                options = policyOptions.map { it.tfliteFile },
+                enabled = policyOptions.isNotEmpty(),
+                onSelect = {
+                    policySelected = it
+                    policyOn = false
+                },
+            )
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = policyHzText,
+                    onValueChange = { policyHzText = it.filter { c -> c.isDigit() || c == '.' }.take(6) },
+                    label = { Text("Policy Hz") },
+                    singleLine = true,
+                )
+                Button(
+                    onClick = { policyOn = !policyOn },
+                    enabled = udpEnabled && policySelected.isNotBlank(),
+                ) { Text(if (policyOn) "Policy: ON" else "Policy: OFF") }
+            }
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = cmdVxText,
+                    onValueChange = { cmdVxText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8) },
+                    label = { Text("cmd vx") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = cmdVyText,
+                    onValueChange = { cmdVyText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8) },
+                    label = { Text("cmd vy") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = cmdWzText,
+                    onValueChange = { cmdWzText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8) },
+                    label = { Text("cmd wz") },
+                    singleLine = true,
+                )
+            }
+
+            MonoBlock(
+                lines =
+                    listOf(
+                        formatFloatList("last_act", policyActionUi),
+                        formatFloatList("targets", policyTargetUi),
+                    ),
+            )
+
+            val policyHz = policyHzText.toFloatOrNull()
+            val policyPeriodNs =
+                policyHz
+                    ?.takeIf { it.isFinite() && it > 0.0f }
+                    ?.let { (1_000_000_000.0 / it.toDouble()).toLong().coerceAtLeast(1L) }
+
+            DisposableEffect(policyOn, udpEnabled, policySelected, policyPeriodNs) {
+                policyFutureRef.getAndSet(null)?.cancel(false)
+                policyExecRef.getAndSet(null)?.shutdownNow()
+                policyOfferHzRef.set(null)
+                runCatching { policyActorRef.getAndSet(null)?.close() }
+
+                if (policyOn && udpEnabled && policySelected.isNotBlank() && policyPeriodNs != null) {
+                    val opt = policyOptions.firstOrNull { it.tfliteFile == policySelected }
+                    if (opt != null) {
+                        val actor =
+                            runCatching {
+                                TfliteActor.fromAsset(
+                                    context = context,
+                                    tfliteFile = opt.tfliteFile,
+                                    stateDim = opt.meta.stateDim,
+                                    actionDim = opt.meta.actionDim,
+                                )
+                            }.getOrNull()
+                        if (actor != null) policyActorRef.set(actor)
+
+                        val exec =
+                            Executors.newSingleThreadScheduledExecutor { r ->
+                                Thread(r, "phonebot-policy-runner").apply { isDaemon = true }
+                            }
+                        val rate = SimpleRateEstimator(alpha = 0.1f)
+                        val lastAct = FloatArray(13) { 0f }
+                        var phaseL = 0.0
+                        val gaitHz = 1.5 // fixed gait clock for phase features
+
+                        val fut =
+                            exec.scheduleAtFixedRate(
+                                {
+                                    val nowNs = System.nanoTime()
+                                    val imu = latestImuRawRef.get()
+                                    val st = latestMotorStatusRef.get()?.first
+                                    val actorNow = policyActorRef.get()
+                                    if (imu == null || st == null || actorNow == null) return@scheduleAtFixedRate
+
+                                    val gyroPhone = imu.gyro ?: return@scheduleAtFixedRate
+                                    val qPhone = imu.gameQuat ?: imu.quat ?: return@scheduleAtFixedRate
+
+                                    val cmdVx = cmdVxText.toFloatOrNull() ?: 0f
+                                    val cmdVy = cmdVyText.toFloatOrNull() ?: 0f
+                                    val cmdWz = cmdWzText.toFloatOrNull() ?: 0f
+
+                                    val obs =
+                                        buildPhonebotObs52(
+                                            qPhoneWxyz = qPhone,
+                                            gyroPhone = gyroPhone,
+                                            jointPosRad = st.posRad,
+                                            jointVelRadS = st.velRadS,
+                                            lastAct = lastAct,
+                                            defaultPose = opt.meta.defaultPose,
+                                            cmdVx = cmdVx,
+                                            cmdVy = cmdVy,
+                                            cmdWz = cmdWz,
+                                            baseToTrunkRad = if (st.posRad.size > 12) st.posRad[12] else 0f,
+                                            mode = opt.mode,
+                                            phaseL = phaseL,
+                                        )
+                                    val act = actorNow.run(obs)
+                                    for (i in 0 until 13) lastAct[i] = act[i]
+
+                                    val tgt = FloatArray(13)
+                                    for (i in 0 until 13) {
+                                        val v = opt.meta.defaultPose[i] + act[i]
+                                        tgt[i] = v.coerceIn(-2.8f, 2.8f)
+                                    }
+                                    latestPolicyActionRef.set(act)
+                                    latestPolicyTargetRef.set(tgt)
+
+                                    val seq = ctrlSeq.incrementAndGet()
+                                    udpCtrlSender.offer(
+                                        PhonebotProtocol.packMotorPacket(
+                                            seq = seq,
+                                            tsNs = nowNs,
+                                            pos = tgt,
+                                            vel = FloatArray(13) { 0f },
+                                            tau = FloatArray(13) { 0f },
+                                        ),
+                                    )
+                                    policyOfferHzRef.set(rate.update(nowNs))
+
+                                    val dt = policyPeriodNs.toDouble() * 1e-9
+                                    phaseL = (phaseL + 2.0 * Math.PI * gaitHz * dt) % (2.0 * Math.PI)
+                                },
+                                0L,
+                                policyPeriodNs,
+                                TimeUnit.NANOSECONDS,
+                            )
+                        policyExecRef.set(exec)
+                        policyFutureRef.set(fut)
+                    }
+                }
+
+                onDispose {
+                    policyFutureRef.getAndSet(null)?.cancel(false)
+                    policyExecRef.getAndSet(null)?.shutdownNow()
+                    policyOfferHzRef.set(null)
+                    runCatching { policyActorRef.getAndSet(null)?.close() }
+                }
             }
 
             val swingHz = swingHzText.toFloatOrNull()
@@ -2235,6 +2455,117 @@ private fun playWavFile(context: Context, wavFile: java.io.File, playerRef: Atom
     mp.prepare()
     mp.start()
     playerRef.set(mp)
+}
+
+private fun buildPhonebotObs52(
+    qPhoneWxyz: FloatArray,
+    gyroPhone: FloatArray,
+    jointPosRad: FloatArray,
+    jointVelRadS: FloatArray,
+    lastAct: FloatArray,
+    defaultPose: FloatArray,
+    cmdVx: Float,
+    cmdVy: Float,
+    cmdWz: Float,
+    baseToTrunkRad: Float,
+    mode: String,
+    phaseL: Double,
+): FloatArray {
+    // This matches NOTE_phonebot_obs_action.md:
+    // [gyro(3), gravity(3), command(3), (q - q_default)(13), qd(13), last_act(13), phase_feat(4)]
+    val out = FloatArray(52)
+
+    // Quaternion constants copied from Ros2_bridge visualizer (wxyz).
+    // Phone body axes -> trunk body axes correction (mounting).
+    val s = (kotlin.math.sqrt(2.0) / 2.0).toFloat()
+    val qPhoneToTrunk = floatArrayOf(0f, 0f, s, s)
+    // IMU site orientation relative to its body frame: 90deg about +Z.
+    val qBodyToImuSite = floatArrayOf(s, 0f, 0f, s)
+
+    // Convert phone gyro to trunk frame.
+    val gyroTrunk = quatRotateVec(qPhoneToTrunk, gyroPhone)
+
+    // Convert trunk gyro to the policy's IMU site frame.
+    val qBaseToTrunk = quatFromAxisAngleZ(baseToTrunkRad)
+    val gyroImu =
+        if (mode.equals("alter", ignoreCase = true)) {
+            // IMU site is on trunk_link in alter mode.
+            quatRotateVec(quatConj(qBodyToImuSite), gyroTrunk)
+        } else {
+            // IMU site is on base link in normal mode.
+            val gyroBase = quatRotateVec(quatConj(qBaseToTrunk), gyroTrunk)
+            quatRotateVec(quatConj(qBodyToImuSite), gyroBase)
+        }
+
+    // Gravity in IMU frame: R_imu^T * [0,0,-1]. We reconstruct q_imu_in_world from phone orientation.
+    val qPhone = qPhoneWxyz
+    val qTrunkWorld = quatMul(qPhone, qPhoneToTrunk) // same convention as visualizer_node.py
+    val qBaseWorld = quatMul(qTrunkWorld, quatFromAxisAngleZ(-baseToTrunkRad))
+    val qImuWorld =
+        if (mode.equals("alter", ignoreCase = true)) {
+            quatMul(qTrunkWorld, qBodyToImuSite)
+        } else {
+            quatMul(qBaseWorld, qBodyToImuSite)
+        }
+    val gravityWorld = floatArrayOf(0f, 0f, -1f)
+    val gravityImu = quatRotateVec(quatConj(qImuWorld), gravityWorld)
+
+    // Fill observation.
+    var i = 0
+    out[i++] = gyroImu[0]; out[i++] = gyroImu[1]; out[i++] = gyroImu[2]
+    out[i++] = gravityImu[0]; out[i++] = gravityImu[1]; out[i++] = gravityImu[2]
+    out[i++] = cmdVx; out[i++] = cmdVy; out[i++] = cmdWz
+
+    for (k in 0 until 13) {
+        val q = if (k < jointPosRad.size) jointPosRad[k] else 0f
+        val q0 = if (k < defaultPose.size) defaultPose[k] else 0f
+        out[i++] = q - q0
+    }
+    for (k in 0 until 13) {
+        val qd = if (k < jointVelRadS.size) jointVelRadS[k] else 0f
+        out[i++] = qd
+    }
+    for (k in 0 until 13) out[i++] = lastAct[k]
+
+    val phaseR = phaseL + Math.PI
+    out[i++] = kotlin.math.cos(phaseL).toFloat()
+    out[i++] = kotlin.math.cos(phaseR).toFloat()
+    out[i++] = kotlin.math.sin(phaseL).toFloat()
+    out[i++] = kotlin.math.sin(phaseR).toFloat()
+
+    return out
+}
+
+private fun quatMul(a: FloatArray, b: FloatArray): FloatArray {
+    // Hamilton product in [w,x,y,z].
+    val aw = a[0]; val ax = a[1]; val ay = a[2]; val az = a[3]
+    val bw = b[0]; val bx = b[1]; val by = b[2]; val bz = b[3]
+    return floatArrayOf(
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+}
+
+private fun quatConj(q: FloatArray): FloatArray = floatArrayOf(q[0], -q[1], -q[2], -q[3])
+
+private fun quatFromAxisAngleZ(theta: Float): FloatArray {
+    val h = 0.5f * theta
+    return floatArrayOf(
+        kotlin.math.cos(h.toDouble()).toFloat(),
+        0f,
+        0f,
+        kotlin.math.sin(h.toDouble()).toFloat(),
+    )
+}
+
+private fun quatRotateVec(q: FloatArray, v: FloatArray): FloatArray {
+    // Rotate vector by quaternion q (wxyz): v' = q * (0,v) * conj(q)
+    val p = floatArrayOf(0f, v[0], v[1], v[2])
+    val qp = quatMul(q, p)
+    val qpq = quatMul(qp, quatConj(q))
+    return floatArrayOf(qpq[1], qpq[2], qpq[3])
 }
 
 private fun Float.fmt(): String = "% .4f".format(this)

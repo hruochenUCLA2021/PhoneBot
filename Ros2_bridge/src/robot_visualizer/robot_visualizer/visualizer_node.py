@@ -58,6 +58,14 @@ def _quat_from_axis_angle_z(theta):
     return np.array([np.cos(theta / 2.0), 0.0, 0.0, np.sin(theta / 2.0)])
 
 
+def _rotate_vec_by_quat(q_wxyz, v_xyz):
+    """Rotate 3D vector by quaternion q (wxyz): v' = q * (0,v) * conj(q)."""
+    p = np.array([0.0, float(v_xyz[0]), float(v_xyz[1]), float(v_xyz[2])])
+    qp = _quat_mul(q_wxyz, p)
+    qpq = _quat_mul(qp, _quat_conj(q_wxyz))
+    return qpq[1:4]
+
+
 # --- Frame conversion ---
 #
 # Phone mounting: screen faces forward, phone top (+Y) points up.
@@ -81,10 +89,21 @@ def _quat_from_axis_angle_z(theta):
 _s = np.sqrt(2.0) / 2.0
 Q_PHONE_TO_TRUNK = np.array([0.0, 0.0, _s, _s])
 
-# IMU site orientation relative to trunk_link body frame (from XML).
-# <site name="imu" quat="0.707107 0.000000 0.000000 0.707107"/>  -> 90 deg about Z
+# --- IMU site frame ---
+#
+# Both XMLs use the SAME imu-site local rotation:
+#   quat="0.707107 0.000000 0.000000 0.707107"  -> 90 deg about +Z
+#
+# What changes across modes is which BODY the site is attached to:
+#
+# - normal mode  (PhonebotJoystickFlatTerrain):
+#     imu site is under base_motor_link in `phonebot_general.xml`
+# - alter mode   (PhonebotJoystickFlatTerrainAlter):
+#     imu site is under trunk_link in `phonebot_general_alternative_imu.xml`
+#
+# We keep two names for clarity even though the numeric quaternion is identical.
+Q_BASE_TO_IMU_SITE = np.array([_s, 0.0, 0.0, _s])
 Q_TRUNK_TO_IMU_SITE = np.array([_s, 0.0, 0.0, _s])
-Q_IMU_SITE_TO_TRUNK = _quat_conj(Q_TRUNK_TO_IMU_SITE)
 
 
 class PhonebotVisualizer(Node):
@@ -94,20 +113,25 @@ class PhonebotVisualizer(Node):
         _default_model = os.path.join(
             get_package_share_directory("robot_visualizer"),
             "model", "model_phonebot",
-            "scene_joystick_flat_terrain_alternative_imu.xml",
+            "scene_joystick_flat_terrain.xml",
         )
         self.declare_parameter("model_path", _default_model)
+        # "normal" => imu site on base link; "alter" => imu site on trunk link.
+        self.declare_parameter("mode", "normal")
         self.declare_parameter("render_hz", 30.0)
         self.declare_parameter("imu_topic", "/phonebot/imu_game")
         self.declare_parameter("motor_state_topic", "/phonebot/motor_state")
 
         model_path = self.get_parameter("model_path").get_parameter_value().string_value
+        self._mode = self.get_parameter("mode").get_parameter_value().string_value.strip().lower() or "normal"
         render_hz = self.get_parameter("render_hz").get_parameter_value().double_value
         imu_topic = self.get_parameter("imu_topic").get_parameter_value().string_value
         motor_topic = self.get_parameter("motor_state_topic").get_parameter_value().string_value
 
         self._base_quat = DEFAULT_BASE_QUAT.copy()
         self._q_trunk = DEFAULT_BASE_QUAT.copy()  # latest trunk orientation in world
+        self._gyro_phone = np.zeros(3)
+        self._accel_phone = np.zeros(3)
         self._joint_pos = np.zeros(NUM_JOINTS)
 
         self.get_logger().info(f"Loading MuJoCo model: {model_path}")
@@ -128,6 +152,9 @@ class PhonebotVisualizer(Node):
         fj_id = mujoco.mj_name2id(self.sim.model, mujoco.mjtObj.mjOBJ_JOINT, "floating_base")
         self._base_qpos_adr = self.sim.model.jnt_qposadr[fj_id] if fj_id >= 0 else 0
 
+        # IMU site id (exists in both normal and alter XMLs with the same name "imu")
+        self._imu_site_id = mujoco.mj_name2id(self.sim.model, mujoco.mjtObj.mjOBJ_SITE, "imu")
+
         self.create_subscription(Imu, imu_topic, self._on_imu, 10)
         self.create_subscription(JointState, motor_topic, self._on_motor_state, 10)
 
@@ -136,7 +163,7 @@ class PhonebotVisualizer(Node):
 
         self.get_logger().info(
             f"Visualizer ready — render {render_hz:.0f} Hz, "
-            f"IMU: {imu_topic}, motors: {motor_topic}"
+            f"mode={self._mode}, IMU: {imu_topic}, motors: {motor_topic}"
         )
 
     def _on_imu(self, msg: Imu):
@@ -146,6 +173,8 @@ class PhonebotVisualizer(Node):
         # Phone is mounted on trunk. Convert phone body frame to trunk/base body frame.
         # q_trunk_in_world = q_phone_in_world * Q_PHONE_TO_TRUNK
         self._q_trunk[:] = _quat_mul(q_phone, Q_PHONE_TO_TRUNK)
+        self._gyro_phone[:] = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
+        self._accel_phone[:] = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
 
     def _on_motor_state(self, msg: JointState):
         n = min(NUM_JOINTS, len(msg.position))
@@ -178,6 +207,62 @@ class PhonebotVisualizer(Node):
         d.qpos[a + 3 : a + 7] = q_base
 
         mujoco.mj_forward(self.sim.model, d)
+
+        # --- Debug draw: gyro/accel axes at the policy's IMU site frame ---
+        # Clear old markers if mujoco_viewer keeps them.
+        for attr in ("markers", "_markers"):
+            m = getattr(self.sim.viewer, attr, None)
+            if isinstance(m, list):
+                m.clear()
+
+        if self._imu_site_id >= 0:
+            site_pos = d.site_xpos[self._imu_site_id].copy()
+            site_mat = d.site_xmat[self._imu_site_id].reshape(3, 3).copy()
+
+            # Convert phone gyro/accel into the IMU site local frame used by the policy obs.
+            # 1) phone -> trunk (mounting): v_trunk = R(q_phone_to_trunk) * v_phone
+            # 2) normal mode only: trunk -> base: v_base = Rz(-theta) * v_trunk
+            # 3) body -> imu_site: v_imu = Rz(-90deg) * v_body  (because imu_site is rotated +90deg about +Z)
+            #
+            # Using quaternion conventions in this file, step (3) is implemented as:
+            #   v_imu = R(q_body_to_imu)^T * v_body
+            # because q_body_to_imu maps imu vectors into body frame.
+            v_trunk_gyro = _rotate_vec_by_quat(Q_PHONE_TO_TRUNK, self._gyro_phone)
+            v_trunk_acc = _rotate_vec_by_quat(Q_PHONE_TO_TRUNK, self._accel_phone)
+
+            if self._mode == "alter":
+                v_body_gyro = v_trunk_gyro
+                v_body_acc = v_trunk_acc
+                q_body_to_imu = Q_TRUNK_TO_IMU_SITE
+            else:
+                q_base_to_trunk = _quat_from_axis_angle_z(trunk_theta)
+                v_body_gyro = _rotate_vec_by_quat(_quat_conj(q_base_to_trunk), v_trunk_gyro)
+                v_body_acc = _rotate_vec_by_quat(_quat_conj(q_base_to_trunk), v_trunk_acc)
+                q_body_to_imu = Q_BASE_TO_IMU_SITE
+
+            gyro_imu = _rotate_vec_by_quat(_quat_conj(q_body_to_imu), v_body_gyro)
+            acc_imu = _rotate_vec_by_quat(_quat_conj(q_body_to_imu), v_body_acc)
+
+            # Draw components along IMU axes (x=red, y=green, z=blue).
+            # Convert IMU-local components to world directions using site_xmat.
+            def draw_vec_components(origin, v_local, scale, alpha):
+                colors = [
+                    (1.0, 0.0, 0.0, alpha),
+                    (0.0, 1.0, 0.0, alpha),
+                    (0.0, 0.0, 1.0, alpha),
+                ]
+                for ax in range(3):
+                    comp = float(v_local[ax])
+                    if abs(comp) < 1e-6:
+                        continue
+                    dir_world = site_mat[:, ax] * np.sign(comp)
+                    self.sim.add_axis_arrow(origin, dir_world, length=abs(comp) * scale, color=colors[ax])
+
+            # Slight Z offset so gyro vs accel don't overlap perfectly.
+            up = site_mat[:, 2]
+            draw_vec_components(site_pos + 0.00 * up, gyro_imu, scale=0.10, alpha=0.8)   # rad/s
+            draw_vec_components(site_pos + 0.03 * up, acc_imu, scale=0.02, alpha=0.8)    # m/s^2
+
         self.sim.viewer.render()
 
     def destroy_node(self):
