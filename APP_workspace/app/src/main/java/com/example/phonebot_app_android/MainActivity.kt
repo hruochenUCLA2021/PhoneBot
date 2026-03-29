@@ -369,6 +369,7 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val latestPolicyActionRef = remember { AtomicReference<FloatArray?>(null) }
     val latestPolicyTargetRef = remember { AtomicReference<FloatArray?>(null) }
     val latestImuRawRef = remember { AtomicReference<ImuState?>(null) }
+    val policyEnableRemoteRef = remember { AtomicReference<Boolean?>(null) }
     var policyActionUi by remember { mutableStateOf<FloatArray?>(null) }
     var policyTargetUi by remember { mutableStateOf<FloatArray?>(null) }
     var policyTestOutUi by remember { mutableStateOf<FloatArray?>(null) }
@@ -488,6 +489,9 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
         }
         udpReceiver.onMotorStatusPacket = { pkt, hz ->
             latestMotorStatusRef.set(pkt to hz)
+        }
+        udpReceiver.onPolicyEnablePacket = { pkt, _hz ->
+            policyEnableRemoteRef.set(pkt.enable)
         }
 
         onDispose {
@@ -1339,6 +1343,10 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                         tempC = pkt.tempC.copyOf(),
                         note = null,
                     )
+            }
+            val pe = policyEnableRemoteRef.getAndSet(null)
+            if (pe != null) {
+                policyOn = pe
             }
             swingOfferHz = swingOfferHzRef.get()
             policyOfferHz = policyOfferHzRef.get()
@@ -2201,6 +2209,25 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     },
                     enabled = policyOptions.isNotEmpty() && policySelected.isNotBlank(),
                 ) { Text("Test policy (one-shot)") }
+
+                Button(
+                    onClick = {
+                        val opt = policyOptions.firstOrNull { it.tfliteFile == policySelected } ?: return@Button
+                        val seq = ctrlSeq.incrementAndGet()
+                        val nowNs = System.nanoTime()
+                        val pos = opt.meta.defaultPose.copyOf()
+                        udpCtrlSender.offer(
+                            PhonebotProtocol.packMotorPacket(
+                                seq = seq,
+                                tsNs = nowNs,
+                                pos = pos,
+                                vel = FloatArray(13) { 0f },
+                                tau = FloatArray(13) { 0f },
+                            ),
+                        )
+                    },
+                    enabled = udpEnabled && policySelected.isNotBlank(),
+                ) { Text("Home position") }
             }
 
             MonoBlock(

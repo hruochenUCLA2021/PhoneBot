@@ -32,12 +32,14 @@ constexpr uint8_t MSG_TYPE_SENSOR = 1;
 constexpr uint8_t MSG_TYPE_MOTOR = 2;
 constexpr uint8_t MSG_TYPE_TORQUE = 3;
 constexpr uint8_t MSG_TYPE_MOTOR_STATUS = 4;
+constexpr uint8_t MSG_TYPE_POLICY_ENABLE = 5;
 constexpr size_t MOTOR_COUNT = 13;
 
 // Fixed sizes (must match Android + udp_protocol.py)
 constexpr size_t SENSOR_SIZE = 116;
 constexpr size_t MOTOR_SIZE = 176;
 constexpr size_t TORQUE_SIZE = 21;  // header(20) + enable(u8)
+constexpr size_t POLICY_ENABLE_SIZE = 21;  // header(20) + enable(u8)
 constexpr size_t MOTOR_STATUS_SIZE = 332;  // header(20) + 6*13*4
 
 inline uint16_t read_u16_le(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
@@ -168,6 +170,17 @@ std::optional<TorquePkt> try_parse_torque_v2(const uint8_t* data, size_t n) {
   return pkt;
 }
 
+std::vector<uint8_t> pack_policy_enable(uint32_t seq, uint64_t ts_ns, bool enable) {
+  std::vector<uint8_t> out(POLICY_ENABLE_SIZE, 0);
+  std::memcpy(out.data(), MAGIC, 4);
+  out[4] = VERSION;
+  out[5] = MSG_TYPE_POLICY_ENABLE;
+  write_u16_le(out.data() + 6, 0);
+  write_u32_le(out.data() + 8, seq);
+  write_u64_le(out.data() + 12, ts_ns);
+  out[20] = enable ? 1 : 0;
+  return out;
+}
 std::vector<uint8_t> pack_motor(uint32_t seq, uint64_t ts_ns,
                                 const std::vector<double>& pos,
                                 const std::vector<double>& vel,
@@ -279,6 +292,7 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     this->declare_parameter<std::string>("motor_topic", "/phonebot/motor_cmd");
     // ROS topic to publish torque enable to (from Android -> UDP -> this bridge)
     this->declare_parameter<std::string>("torque_topic", "/phonebot/torque_enable");
+    this->declare_parameter<std::string>("policy_enable_topic", "/phonebot/policy_enable");
     // ROS topic to subscribe motor state from (Pi HWdriver -> ROS2 -> this bridge -> UDP -> Android)
     this->declare_parameter<std::string>("motor_state_full_topic", "/phonebot/motor_state_full");
     this->declare_parameter<std::string>("android_ip", "192.168.20.2");
@@ -291,6 +305,7 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     if (!topic_ns.empty() && topic_ns.back() == '/') topic_ns.pop_back();
     auto motor_topic = this->get_parameter("motor_topic").as_string();
     auto torque_topic = this->get_parameter("torque_topic").as_string();
+    auto policy_enable_topic = this->get_parameter("policy_enable_topic").as_string();
     auto motor_state_full_topic = this->get_parameter("motor_state_full_topic").as_string();
     android_ip_ = this->get_parameter("android_ip").as_string();
     android_port_ = (int)this->get_parameter("android_port").as_int();
@@ -305,6 +320,10 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     motor_state_full_sub_ = this->create_subscription<motor_interfaces::msg::MotorState>(
         motor_state_full_topic, 10,
         std::bind(&UdpToRos2ImmediateBridgeCpp::on_motor_state_full, this, std::placeholders::_1));
+
+    policy_enable_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        policy_enable_topic, 10,
+        std::bind(&UdpToRos2ImmediateBridgeCpp::on_policy_enable, this, std::placeholders::_1));
 
     // RX socket
     rx_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -444,6 +463,13 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     (void)::sendto(tx_fd_, payload.data(), payload.size(), 0, (sockaddr*)&android_addr_, sizeof(android_addr_));
   }
 
+  void on_policy_enable(const std_msgs::msg::Bool::SharedPtr msg) {
+    uint64_t ts_ns = (uint64_t)this->now().nanoseconds();
+    uint32_t seq = (tx_seq_.fetch_add(1) + 1);
+    auto payload = pack_policy_enable(seq, ts_ns, (bool)msg->data);
+    (void)::sendto(tx_fd_, payload.data(), payload.size(), 0, (sockaddr*)&android_addr_, sizeof(android_addr_));
+  }
+
   // ROS
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_game_;
@@ -452,6 +478,7 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_motor_cmd_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_torque_;
   rclcpp::Subscription<motor_interfaces::msg::MotorState>::SharedPtr motor_state_full_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr policy_enable_sub_;
 
   // UDP
   int rx_fd_{-1};

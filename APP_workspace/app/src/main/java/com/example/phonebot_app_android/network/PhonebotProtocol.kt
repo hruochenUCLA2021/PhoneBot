@@ -21,6 +21,7 @@ object PhonebotProtocol {
     const val MSG_TYPE_MOTOR: Byte = 2
     const val MSG_TYPE_TORQUE: Byte = 3
     const val MSG_TYPE_MOTOR_STATUS: Byte = 4
+    const val MSG_TYPE_POLICY_ENABLE: Byte = 5
 
     private const val MOTOR_COUNT: Int = 13
 
@@ -35,6 +36,8 @@ object PhonebotProtocol {
     const val MOTOR_PACKET_SIZE_BYTES: Int = 176
     // TORQUE packet total size: header(20) + enable(u8) = 21 bytes
     const val TORQUE_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + 1
+    // POLICY_ENABLE packet total size: header(20) + enable(u8) = 21 bytes
+    const val POLICY_ENABLE_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + 1
     // MOTOR_STATUS packet total size: header(20) + 6*13 float32 = 332 bytes
     const val MOTOR_STATUS_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + (6 * MOTOR_COUNT * 4)
 
@@ -47,6 +50,12 @@ object PhonebotProtocol {
     )
 
     data class TorquePacket(
+        val seq: Long,
+        val tsNs: Long,
+        val enable: Boolean,
+    )
+
+    data class PolicyEnablePacket(
         val seq: Long,
         val tsNs: Long,
         val enable: Boolean,
@@ -224,6 +233,39 @@ object PhonebotProtocol {
         buf.putLong(tsNs)
         buf.put(if (enable) 1 else 0)
         return buf.array()
+    }
+
+    fun packPolicyEnablePacket(
+        seq: Long,
+        tsNs: Long,
+        enable: Boolean,
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(POLICY_ENABLE_PACKET_SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(MAGIC)
+        buf.put(VERSION)
+        buf.put(MSG_TYPE_POLICY_ENABLE)
+        buf.putShort(0) // flags
+        buf.putInt(seq.toInt())
+        buf.putLong(tsNs)
+        buf.put(if (enable) 1 else 0)
+        return buf.array()
+    }
+
+    fun tryParsePolicyEnablePacket(payload: ByteArray): PolicyEnablePacket? {
+        if (payload.size < POLICY_ENABLE_PACKET_SIZE_BYTES) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        val magic = ByteArray(4)
+        buf.get(magic)
+        if (!magic.contentEquals(MAGIC)) return null
+        val version = buf.get()
+        if (version != VERSION) return null
+        val msgType = buf.get()
+        if (msgType != MSG_TYPE_POLICY_ENABLE) return null
+        /* flags */ buf.short
+        val seq = buf.int.toLong() and 0xFFFF_FFFFL
+        val tsNs = buf.long
+        val enable = (buf.get().toInt() != 0)
+        return PolicyEnablePacket(seq = seq, tsNs = tsNs, enable = enable)
     }
 
     fun tryParseTorquePacket(payload: ByteArray): TorquePacket? {

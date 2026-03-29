@@ -37,6 +37,7 @@ class UdpToRos2ImmediateBridge(Node):
         self.declare_parameter("motor_state_full_topic", "/phonebot/motor_state_full")
         self.declare_parameter("android_ip", "192.168.20.2")
         self.declare_parameter("android_port", 6006)
+        self.declare_parameter("policy_enable_topic", "/phonebot/policy_enable")
 
         bind_ip = self.get_parameter("bind_ip").get_parameter_value().string_value
         bind_port = self.get_parameter("bind_port").get_parameter_value().integer_value
@@ -46,6 +47,7 @@ class UdpToRos2ImmediateBridge(Node):
         motor_state_full_topic = self.get_parameter("motor_state_full_topic").get_parameter_value().string_value
         self._android_ip = self.get_parameter("android_ip").get_parameter_value().string_value
         self._android_port = int(self.get_parameter("android_port").get_parameter_value().integer_value)
+        policy_enable_topic = self.get_parameter("policy_enable_topic").get_parameter_value().string_value
 
         self.pub_imu = self.create_publisher(Imu, f"/{topic_ns}/imu", 10)
         self.pub_imu_game = self.create_publisher(Imu, f"/{topic_ns}/imu_game", 10)
@@ -60,6 +62,11 @@ class UdpToRos2ImmediateBridge(Node):
         # Pi -> Android
         self._motor_state_sub = self.create_subscription(
             MotorState, motor_state_full_topic, self._on_motor_state_full, 10
+        )
+
+        # PC -> Android: allow ROS2 to toggle Android on-device policy runner.
+        self._policy_enable_sub = self.create_subscription(
+            Bool, policy_enable_topic, self._on_policy_enable, 10
         )
 
         # (Legacy) Subscribe to motor commands and forward to Android via UDP.
@@ -186,6 +193,16 @@ class UdpToRos2ImmediateBridge(Node):
             self._tx_sock.sendto(payload, (self._android_ip, self._android_port))
         except Exception as e:
             self.get_logger().warn(f"MotorState UDP send failed: {e}")
+
+    def _on_policy_enable(self, msg: Bool) -> None:
+        # Forward policy enable to Android via UDP.
+        ts_ns = int(self.get_clock().now().nanoseconds)
+        self._tx_seq = (self._tx_seq + 1) & 0xFFFF_FFFF
+        payload = udp_protocol.pack_policy_enable(self._tx_seq, ts_ns, bool(msg.data))
+        try:
+            self._tx_sock.sendto(payload, (self._android_ip, self._android_port))
+        except Exception as e:
+            self.get_logger().warn(f"policy_enable UDP send failed: {e}")
 
 
 def _vec3_from_xyz(v) -> Vector3:

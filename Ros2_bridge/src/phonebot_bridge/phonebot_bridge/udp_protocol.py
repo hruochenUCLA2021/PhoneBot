@@ -21,6 +21,7 @@ MSG_TYPE_SENSOR = 1
 MSG_TYPE_MOTOR = 2
 MSG_TYPE_TORQUE = 3
 MSG_TYPE_MOTOR_STATUS = 4
+MSG_TYPE_POLICY_ENABLE = 5
 
 MOTOR_COUNT = 13
 
@@ -44,6 +45,10 @@ MOTOR_STATUS_SIZE = struct.calcsize(MOTOR_STATUS_FMT)  # 332
 # Torque packet total: 21 bytes (header 20 + enable u8)
 TORQUE_FMT = "<4sBBHIQB"
 TORQUE_SIZE = struct.calcsize(TORQUE_FMT)  # 21
+
+# Policy-enable packet total: 21 bytes (header 20 + enable u8)
+POLICY_ENABLE_FMT = "<4sBBHIQB"
+POLICY_ENABLE_SIZE = struct.calcsize(POLICY_ENABLE_FMT)  # 21
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,13 @@ class MotorPacket:
 
 @dataclass(frozen=True)
 class TorquePacket:
+    seq: int
+    ts_ns: int
+    enable: bool
+
+
+@dataclass(frozen=True)
+class PolicyEnablePacket:
     seq: int
     ts_ns: int
     enable: bool
@@ -193,6 +205,18 @@ def try_parse_torque(payload: bytes) -> Optional[TorquePacket]:
     return TorquePacket(seq=int(seq), ts_ns=int(ts_ns), enable=(int(enable_u8) != 0))
 
 
+def try_parse_policy_enable(payload: bytes) -> Optional[PolicyEnablePacket]:
+    if len(payload) < POLICY_ENABLE_SIZE:
+        return None
+    try:
+        magic, version, msg_type, flags, seq, ts_ns, enable_u8 = struct.unpack_from(POLICY_ENABLE_FMT, payload, 0)
+    except struct.error:
+        return None
+    if magic != MAGIC or version != VERSION or msg_type != MSG_TYPE_POLICY_ENABLE:
+        return None
+    return PolicyEnablePacket(seq=int(seq), ts_ns=int(ts_ns), enable=(int(enable_u8) != 0))
+
+
 def try_parse_motor_status(payload: bytes) -> Optional[MotorStatusPacket]:
     if len(payload) < MOTOR_STATUS_SIZE:
         return None
@@ -245,6 +269,19 @@ def pack_torque(seq: int, ts_ns: int, enable: bool) -> bytes:
         MAGIC,
         VERSION,
         MSG_TYPE_TORQUE,
+        0,
+        int(seq) & 0xFFFFFFFF,
+        int(ts_ns),
+        1 if enable else 0,
+    )
+
+
+def pack_policy_enable(seq: int, ts_ns: int, enable: bool) -> bytes:
+    return struct.pack(
+        POLICY_ENABLE_FMT,
+        MAGIC,
+        VERSION,
+        MSG_TYPE_POLICY_ENABLE,
         0,
         int(seq) & 0xFFFFFFFF,
         int(ts_ns),
