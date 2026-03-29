@@ -281,6 +281,7 @@ INFO:     127.0.0.1:33854 - "POST /api/llm/text HTTP/1.1" 200 OK
 
 
 
+please read ::reference_note/NOTE_joystick_command.md
 
 ros2 run joy joy_node
 
@@ -291,6 +292,17 @@ ros2 topic hz /joy --window 50
 
 ros2 run teleop_twist_joy teleop_node   --ros-args --params-file joystick_config.yaml
 ros2 topic hz /cmd_vel --window 50
+
+
+ros2 run joystick_python cmd_vel_repeater --ros-args -p mode:=joystick -p publish_hz:=50.0
+ros2 run joystick_cpp cmd_vel_repeater --ros-args -p mode:=joystick -p publish_hz:=50.0
+
+
+ros2 run joystick_python cmd_vel_repeater --ros-args -p mode:=keyboard -p publish_hz:=50.0
+
+
+ros2 run phonebot_bridge phonebot_udp_bridge_immediate --ros-args -p android_ip:=192.168.20.6
+ros2 run phonebot_bridge_cpp phonebot_udp_bridge_immediate_cpp  --ros-args -p android_ip:=192.168.20.6
 
 
 
