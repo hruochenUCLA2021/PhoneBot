@@ -22,6 +22,7 @@ MSG_TYPE_MOTOR = 2
 MSG_TYPE_TORQUE = 3
 MSG_TYPE_MOTOR_STATUS = 4
 MSG_TYPE_POLICY_ENABLE = 5
+MSG_TYPE_CMD_VEL = 6
 
 MOTOR_COUNT = 13
 
@@ -49,6 +50,10 @@ TORQUE_SIZE = struct.calcsize(TORQUE_FMT)  # 21
 # Policy-enable packet total: 21 bytes (header 20 + enable u8)
 POLICY_ENABLE_FMT = "<4sBBHIQB"
 POLICY_ENABLE_SIZE = struct.calcsize(POLICY_ENABLE_FMT)  # 21
+
+# CmdVel packet: header(20) + 3 float32
+CMD_VEL_FMT = "<4sBBHIQ3f"
+CMD_VEL_SIZE = struct.calcsize(CMD_VEL_FMT)  # 32
 
 
 @dataclass(frozen=True)
@@ -91,6 +96,15 @@ class PolicyEnablePacket:
     seq: int
     ts_ns: int
     enable: bool
+
+
+@dataclass(frozen=True)
+class CmdVelPacket:
+    seq: int
+    ts_ns: int
+    vx: float
+    vy: float
+    wz: float
 
 
 @dataclass(frozen=True)
@@ -217,6 +231,18 @@ def try_parse_policy_enable(payload: bytes) -> Optional[PolicyEnablePacket]:
     return PolicyEnablePacket(seq=int(seq), ts_ns=int(ts_ns), enable=(int(enable_u8) != 0))
 
 
+def try_parse_cmd_vel(payload: bytes) -> Optional[CmdVelPacket]:
+    if len(payload) < CMD_VEL_SIZE:
+        return None
+    try:
+        magic, version, msg_type, flags, seq, ts_ns, vx, vy, wz = struct.unpack_from(CMD_VEL_FMT, payload, 0)
+    except struct.error:
+        return None
+    if magic != MAGIC or version != VERSION or msg_type != MSG_TYPE_CMD_VEL:
+        return None
+    return CmdVelPacket(seq=int(seq), ts_ns=int(ts_ns), vx=float(vx), vy=float(vy), wz=float(wz))
+
+
 def try_parse_motor_status(payload: bytes) -> Optional[MotorStatusPacket]:
     if len(payload) < MOTOR_STATUS_SIZE:
         return None
@@ -286,6 +312,21 @@ def pack_policy_enable(seq: int, ts_ns: int, enable: bool) -> bytes:
         int(seq) & 0xFFFFFFFF,
         int(ts_ns),
         1 if enable else 0,
+    )
+
+
+def pack_cmd_vel(seq: int, ts_ns: int, vx: float, vy: float, wz: float) -> bytes:
+    return struct.pack(
+        CMD_VEL_FMT,
+        MAGIC,
+        VERSION,
+        MSG_TYPE_CMD_VEL,
+        0,
+        int(seq) & 0xFFFFFFFF,
+        int(ts_ns),
+        float(vx),
+        float(vy),
+        float(wz),
     )
 
 

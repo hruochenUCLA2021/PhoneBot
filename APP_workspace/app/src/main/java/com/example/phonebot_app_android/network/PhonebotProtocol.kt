@@ -22,6 +22,7 @@ object PhonebotProtocol {
     const val MSG_TYPE_TORQUE: Byte = 3
     const val MSG_TYPE_MOTOR_STATUS: Byte = 4
     const val MSG_TYPE_POLICY_ENABLE: Byte = 5
+    const val MSG_TYPE_CMD_VEL: Byte = 6
 
     private const val MOTOR_COUNT: Int = 13
 
@@ -40,6 +41,8 @@ object PhonebotProtocol {
     const val POLICY_ENABLE_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + 1
     // MOTOR_STATUS packet total size: header(20) + 6*13 float32 = 332 bytes
     const val MOTOR_STATUS_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + (6 * MOTOR_COUNT * 4)
+    // CMD_VEL packet total size: header(20) + 3 float32 = 32 bytes
+    const val CMD_VEL_PACKET_SIZE_BYTES: Int = HEADER_SIZE_BYTES + (3 * 4)
 
     data class MotorPacket(
         val seq: Long,
@@ -59,6 +62,14 @@ object PhonebotProtocol {
         val seq: Long,
         val tsNs: Long,
         val enable: Boolean,
+    )
+
+    data class CmdVelPacket(
+        val seq: Long,
+        val tsNs: Long,
+        val vx: Float,
+        val vy: Float,
+        val wz: Float,
     )
 
     data class MotorStatusPacket(
@@ -266,6 +277,45 @@ object PhonebotProtocol {
         val tsNs = buf.long
         val enable = (buf.get().toInt() != 0)
         return PolicyEnablePacket(seq = seq, tsNs = tsNs, enable = enable)
+    }
+
+    fun packCmdVelPacket(
+        seq: Long,
+        tsNs: Long,
+        vx: Float,
+        vy: Float,
+        wz: Float,
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(CMD_VEL_PACKET_SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(MAGIC)
+        buf.put(VERSION)
+        buf.put(MSG_TYPE_CMD_VEL)
+        buf.putShort(0)
+        buf.putInt(seq.toInt())
+        buf.putLong(tsNs)
+        buf.putFloat(vx)
+        buf.putFloat(vy)
+        buf.putFloat(wz)
+        return buf.array()
+    }
+
+    fun tryParseCmdVelPacket(payload: ByteArray): CmdVelPacket? {
+        if (payload.size < CMD_VEL_PACKET_SIZE_BYTES) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        val magic = ByteArray(4)
+        buf.get(magic)
+        if (!magic.contentEquals(MAGIC)) return null
+        val version = buf.get()
+        if (version != VERSION) return null
+        val msgType = buf.get()
+        if (msgType != MSG_TYPE_CMD_VEL) return null
+        /* flags */ buf.short
+        val seq = buf.int.toLong() and 0xFFFF_FFFFL
+        val tsNs = buf.long
+        val vx = buf.float
+        val vy = buf.float
+        val wz = buf.float
+        return CmdVelPacket(seq = seq, tsNs = tsNs, vx = vx, vy = vy, wz = wz)
     }
 
     fun tryParseTorquePacket(payload: ByteArray): TorquePacket? {

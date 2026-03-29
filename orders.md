@@ -277,3 +277,20 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8088 (Press CTRL+C to quit)
 INFO:     127.0.0.1:33854 - "POST /api/llm/text HTTP/1.1" 200 OK
 
+
+
+
+
+
+ros2 run joy joy_node
+
+ros2 topic echo /joy
+ros2 topic hz /joy --window 50
+
+
+
+ros2 run teleop_twist_joy teleop_node   --ros-args --params-file joystick_config.yaml
+ros2 topic hz /cmd_vel --window 50
+
+
+

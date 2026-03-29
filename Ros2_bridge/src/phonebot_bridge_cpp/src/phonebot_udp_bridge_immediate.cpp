@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "geometry_msgs/msg/quaternion.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/vector3.hpp"
 #include "motor_interfaces/msg/motor_state.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -33,6 +34,7 @@ constexpr uint8_t MSG_TYPE_MOTOR = 2;
 constexpr uint8_t MSG_TYPE_TORQUE = 3;
 constexpr uint8_t MSG_TYPE_MOTOR_STATUS = 4;
 constexpr uint8_t MSG_TYPE_POLICY_ENABLE = 5;
+constexpr uint8_t MSG_TYPE_CMD_VEL = 6;
 constexpr size_t MOTOR_COUNT = 13;
 
 // Fixed sizes (must match Android + udp_protocol.py)
@@ -40,6 +42,7 @@ constexpr size_t SENSOR_SIZE = 116;
 constexpr size_t MOTOR_SIZE = 176;
 constexpr size_t TORQUE_SIZE = 21;  // header(20) + enable(u8)
 constexpr size_t POLICY_ENABLE_SIZE = 21;  // header(20) + enable(u8)
+constexpr size_t CMD_VEL_SIZE = 32;  // header(20) + 3*f32
 constexpr size_t MOTOR_STATUS_SIZE = 332;  // header(20) + 6*13*4
 
 inline uint16_t read_u16_le(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
@@ -181,6 +184,21 @@ std::vector<uint8_t> pack_policy_enable(uint32_t seq, uint64_t ts_ns, bool enabl
   out[20] = enable ? 1 : 0;
   return out;
 }
+
+std::vector<uint8_t> pack_cmd_vel(uint32_t seq, uint64_t ts_ns, float vx, float vy, float wz) {
+  std::vector<uint8_t> out(CMD_VEL_SIZE, 0);
+  std::memcpy(out.data(), MAGIC, 4);
+  out[4] = VERSION;
+  out[5] = MSG_TYPE_CMD_VEL;
+  write_u16_le(out.data() + 6, 0);
+  write_u32_le(out.data() + 8, seq);
+  write_u64_le(out.data() + 12, ts_ns);
+  size_t off = 20;
+  write_f32_le(out.data() + off, vx); off += 4;
+  write_f32_le(out.data() + off, vy); off += 4;
+  write_f32_le(out.data() + off, wz); off += 4;
+  return out;
+}
 std::vector<uint8_t> pack_motor(uint32_t seq, uint64_t ts_ns,
                                 const std::vector<double>& pos,
                                 const std::vector<double>& vel,
@@ -293,6 +311,7 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     // ROS topic to publish torque enable to (from Android -> UDP -> this bridge)
     this->declare_parameter<std::string>("torque_topic", "/phonebot/torque_enable");
     this->declare_parameter<std::string>("policy_enable_topic", "/phonebot/policy_enable");
+    this->declare_parameter<std::string>("cmd_vel_topic", "/phonebot/cmd_vel");
     // ROS topic to subscribe motor state from (Pi HWdriver -> ROS2 -> this bridge -> UDP -> Android)
     this->declare_parameter<std::string>("motor_state_full_topic", "/phonebot/motor_state_full");
     this->declare_parameter<std::string>("android_ip", "192.168.20.2");
@@ -306,6 +325,7 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     auto motor_topic = this->get_parameter("motor_topic").as_string();
     auto torque_topic = this->get_parameter("torque_topic").as_string();
     auto policy_enable_topic = this->get_parameter("policy_enable_topic").as_string();
+    auto cmd_vel_topic = this->get_parameter("cmd_vel_topic").as_string();
     auto motor_state_full_topic = this->get_parameter("motor_state_full_topic").as_string();
     android_ip_ = this->get_parameter("android_ip").as_string();
     android_port_ = (int)this->get_parameter("android_port").as_int();
@@ -324,6 +344,10 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     policy_enable_sub_ = this->create_subscription<std_msgs::msg::Bool>(
         policy_enable_topic, 10,
         std::bind(&UdpToRos2ImmediateBridgeCpp::on_policy_enable, this, std::placeholders::_1));
+
+    cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        cmd_vel_topic, 10,
+        std::bind(&UdpToRos2ImmediateBridgeCpp::on_cmd_vel, this, std::placeholders::_1));
 
     // RX socket
     rx_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -470,6 +494,13 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
     (void)::sendto(tx_fd_, payload.data(), payload.size(), 0, (sockaddr*)&android_addr_, sizeof(android_addr_));
   }
 
+  void on_cmd_vel(const geometry_msgs::msg::Twist::SharedPtr msg) {
+    uint64_t ts_ns = (uint64_t)this->now().nanoseconds();
+    uint32_t seq = (tx_seq_.fetch_add(1) + 1);
+    auto payload = pack_cmd_vel(seq, ts_ns, (float)msg->linear.x, (float)msg->linear.y, (float)msg->angular.z);
+    (void)::sendto(tx_fd_, payload.data(), payload.size(), 0, (sockaddr*)&android_addr_, sizeof(android_addr_));
+  }
+
   // ROS
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_game_;
@@ -479,6 +510,7 @@ class UdpToRos2ImmediateBridgeCpp : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_torque_;
   rclcpp::Subscription<motor_interfaces::msg::MotorState>::SharedPtr motor_state_full_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr policy_enable_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
 
   // UDP
   int rx_fd_{-1};

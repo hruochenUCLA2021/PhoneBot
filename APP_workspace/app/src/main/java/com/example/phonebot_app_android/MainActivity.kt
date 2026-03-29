@@ -377,6 +377,11 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     var cmdVxText by rememberSaveable { mutableStateOf("0.0") }
     var cmdVyText by rememberSaveable { mutableStateOf("0.0") }
     var cmdWzText by rememberSaveable { mutableStateOf("0.0") }
+    var cmdVelHzUi by remember { mutableStateOf<Float?>(null) }
+    var cmdVelRemoteActiveUi by remember { mutableStateOf(false) }
+    val cmdVelRef = remember { AtomicReference(floatArrayOf(0f, 0f, 0f)) } // vx, vy, wz
+    val cmdVelHzRef = remember { AtomicReference<Float?>(null) }
+    val cmdVelLastRxNsRef = remember { AtomicLong(0L) }
 
     // Page selection
     var page by rememberSaveable { mutableStateOf(0) } // 0=dashboard, 1=camera, 2=llm, 3=animation
@@ -492,6 +497,11 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
         }
         udpReceiver.onPolicyEnablePacket = { pkt, _hz ->
             policyEnableRemoteRef.set(pkt.enable)
+        }
+        udpReceiver.onCmdVelPacket = { pkt, hz ->
+            cmdVelRef.set(floatArrayOf(pkt.vx, pkt.vy, pkt.wz))
+            cmdVelHzRef.set(hz)
+            cmdVelLastRxNsRef.set(System.nanoTime())
         }
 
         onDispose {
@@ -1348,6 +1358,24 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             if (pe != null) {
                 policyOn = pe
             }
+            val nowNs = System.nanoTime()
+            val cmdVelAgeNs = nowNs - cmdVelLastRxNsRef.get()
+            val remoteCmdActive = cmdVelLastRxNsRef.get() != 0L && cmdVelAgeNs in 0..1_000_000_000L
+            cmdVelRemoteActiveUi = remoteCmdActive
+            if (remoteCmdActive) {
+                val cmd = cmdVelRef.get()
+                cmdVxText = String.format(Locale.US, "%.3f", cmd[0])
+                cmdVyText = String.format(Locale.US, "%.3f", cmd[1])
+                cmdWzText = String.format(Locale.US, "%.3f", cmd[2])
+                cmdVelHzUi = cmdVelHzRef.get()
+            } else {
+                // Allow manual editing if no recent remote cmd.
+                val vx = cmdVxText.toFloatOrNull() ?: 0f
+                val vy = cmdVyText.toFloatOrNull() ?: 0f
+                val wz = cmdWzText.toFloatOrNull() ?: 0f
+                cmdVelRef.set(floatArrayOf(vx, vy, wz))
+                cmdVelHzUi = null
+            }
             swingOfferHz = swingOfferHzRef.get()
             policyOfferHz = policyOfferHzRef.get()
             policyActionUi = latestPolicyActionRef.get()
@@ -2089,6 +2117,8 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                         "env           : ${
                             policyOptions.firstOrNull { it.tfliteFile == policySelected }?.meta?.envName ?: "?"
                         }",
+                        "cmd_vel remote: ${if (cmdVelRemoteActiveUi) "ON" else "OFF"}" +
+                            (cmdVelHzUi?.let { String.format(Locale.US, " (%.1f Hz)", it) } ?: ""),
                     ),
             )
 
@@ -2124,26 +2154,42 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             }
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val remoteCmdActive = cmdVelRemoteActiveUi
                 OutlinedTextField(
                     modifier = Modifier.weight(1f),
                     value = cmdVxText,
-                    onValueChange = { cmdVxText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8) },
+                    onValueChange = {
+                        if (!remoteCmdActive) {
+                            cmdVxText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8)
+                        }
+                    },
                     label = { Text("cmd vx") },
                     singleLine = true,
+                    readOnly = remoteCmdActive,
                 )
                 OutlinedTextField(
                     modifier = Modifier.weight(1f),
                     value = cmdVyText,
-                    onValueChange = { cmdVyText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8) },
+                    onValueChange = {
+                        if (!remoteCmdActive) {
+                            cmdVyText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8)
+                        }
+                    },
                     label = { Text("cmd vy") },
                     singleLine = true,
+                    readOnly = remoteCmdActive,
                 )
                 OutlinedTextField(
                     modifier = Modifier.weight(1f),
                     value = cmdWzText,
-                    onValueChange = { cmdWzText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8) },
+                    onValueChange = {
+                        if (!remoteCmdActive) {
+                            cmdWzText = it.filter { c -> c.isDigit() || c == '.' || c == '-' }.take(8)
+                        }
+                    },
                     label = { Text("cmd wz") },
                     singleLine = true,
+                    readOnly = remoteCmdActive,
                 )
             }
 
@@ -2285,9 +2331,10 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                                     val gyroPhone = imu.gyro ?: return@scheduleAtFixedRate
                                     val qPhone = imu.gameQuat ?: imu.quat ?: return@scheduleAtFixedRate
 
-                                    val cmdVx = cmdVxText.toFloatOrNull() ?: 0f
-                                    val cmdVy = cmdVyText.toFloatOrNull() ?: 0f
-                                    val cmdWz = cmdWzText.toFloatOrNull() ?: 0f
+                                    val cmd = cmdVelRef.get()
+                                    val cmdVx = cmd[0]
+                                    val cmdVy = cmd[1]
+                                    val cmdWz = cmd[2]
 
                                     val obs =
                                         buildPhonebotObs52(

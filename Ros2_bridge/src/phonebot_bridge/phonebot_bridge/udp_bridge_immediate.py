@@ -6,6 +6,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Quaternion, Vector3
+from geometry_msgs.msg import Twist
 from sensor_msgs.msg import BatteryState, Imu
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
@@ -38,6 +39,7 @@ class UdpToRos2ImmediateBridge(Node):
         self.declare_parameter("android_ip", "192.168.20.2")
         self.declare_parameter("android_port", 6006)
         self.declare_parameter("policy_enable_topic", "/phonebot/policy_enable")
+        self.declare_parameter("cmd_vel_topic", "/phonebot/cmd_vel")
 
         bind_ip = self.get_parameter("bind_ip").get_parameter_value().string_value
         bind_port = self.get_parameter("bind_port").get_parameter_value().integer_value
@@ -48,6 +50,7 @@ class UdpToRos2ImmediateBridge(Node):
         self._android_ip = self.get_parameter("android_ip").get_parameter_value().string_value
         self._android_port = int(self.get_parameter("android_port").get_parameter_value().integer_value)
         policy_enable_topic = self.get_parameter("policy_enable_topic").get_parameter_value().string_value
+        cmd_vel_topic = self.get_parameter("cmd_vel_topic").get_parameter_value().string_value
 
         self.pub_imu = self.create_publisher(Imu, f"/{topic_ns}/imu", 10)
         self.pub_imu_game = self.create_publisher(Imu, f"/{topic_ns}/imu_game", 10)
@@ -67,6 +70,9 @@ class UdpToRos2ImmediateBridge(Node):
         # PC -> Android: allow ROS2 to toggle Android on-device policy runner.
         self._policy_enable_sub = self.create_subscription(
             Bool, policy_enable_topic, self._on_policy_enable, 10
+        )
+        self._cmd_vel_sub = self.create_subscription(
+            Twist, cmd_vel_topic, self._on_cmd_vel, 10
         )
 
         # (Legacy) Subscribe to motor commands and forward to Android via UDP.
@@ -203,6 +209,22 @@ class UdpToRos2ImmediateBridge(Node):
             self._tx_sock.sendto(payload, (self._android_ip, self._android_port))
         except Exception as e:
             self.get_logger().warn(f"policy_enable UDP send failed: {e}")
+
+    def _on_cmd_vel(self, msg: Twist) -> None:
+        # Forward cmd_vel (vx, vy, wz) to Android via UDP.
+        ts_ns = int(self.get_clock().now().nanoseconds)
+        self._tx_seq = (self._tx_seq + 1) & 0xFFFF_FFFF
+        payload = udp_protocol.pack_cmd_vel(
+            self._tx_seq,
+            ts_ns,
+            vx=float(msg.linear.x),
+            vy=float(msg.linear.y),
+            wz=float(msg.angular.z),
+        )
+        try:
+            self._tx_sock.sendto(payload, (self._android_ip, self._android_port))
+        except Exception as e:
+            self.get_logger().warn(f"cmd_vel UDP send failed: {e}")
 
 
 def _vec3_from_xyz(v) -> Vector3:

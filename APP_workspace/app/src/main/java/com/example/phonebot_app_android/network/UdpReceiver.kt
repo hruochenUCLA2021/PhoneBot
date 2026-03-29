@@ -39,6 +39,7 @@ class UdpReceiver {
     var onMotorPacket: ((PhonebotProtocol.MotorPacket, Float?) -> Unit)? = null
     var onMotorStatusPacket: ((PhonebotProtocol.MotorStatusPacket, Float?) -> Unit)? = null
     var onPolicyEnablePacket: ((PhonebotProtocol.PolicyEnablePacket, Float?) -> Unit)? = null
+    var onCmdVelPacket: ((PhonebotProtocol.CmdVelPacket, Float?) -> Unit)? = null
 
     fun start(listenPort: Int) {
         stop()
@@ -69,6 +70,11 @@ class UdpReceiver {
                             val pe = PhonebotProtocol.tryParsePolicyEnablePacket(payload)
                             if (pe != null) {
                                 onPolicyEnablePacket?.invoke(pe, hz)
+                                continue
+                            }
+                            val cv = PhonebotProtocol.tryParseCmdVelPacket(payload)
+                            if (cv != null) {
+                                onCmdVelPacket?.invoke(cv, hz)
                                 continue
                             }
                             val motor = PhonebotProtocol.tryParseMotorPacket(payload)
