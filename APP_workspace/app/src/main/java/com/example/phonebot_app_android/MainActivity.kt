@@ -371,6 +371,8 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
     val latestImuRawRef = remember { AtomicReference<ImuState?>(null) }
     var policyActionUi by remember { mutableStateOf<FloatArray?>(null) }
     var policyTargetUi by remember { mutableStateOf<FloatArray?>(null) }
+    var policyTestOutUi by remember { mutableStateOf<FloatArray?>(null) }
+    var policyTestStatus by remember { mutableStateOf<String?>(null) }
     var cmdVxText by rememberSaveable { mutableStateOf("0.0") }
     var cmdVyText by rememberSaveable { mutableStateOf("0.0") }
     var cmdWzText by rememberSaveable { mutableStateOf("0.0") }
@@ -2142,6 +2144,70 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
                     listOf(
                         formatFloatList("last_act", policyActionUi),
                         formatFloatList("targets", policyTargetUi),
+                    ),
+            )
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        val opt = policyOptions.firstOrNull { it.tfliteFile == policySelected }
+                        if (opt == null) {
+                            policyTestStatus = "No policy selected"
+                            policyTestOutUi = null
+                            return@Button
+                        }
+                        policyTestStatus = "Running one-shot inference..."
+                        policyTestOutUi = null
+
+                        // One-shot, off UI thread.
+                        Executors.newSingleThreadExecutor().execute {
+                            try {
+                                val actor =
+                                    TfliteActor.fromAsset(
+                                        context = context,
+                                        tfliteFile = opt.tfliteFile,
+                                        stateDim = opt.meta.stateDim,
+                                        actionDim = opt.meta.actionDim,
+                                    )
+                                actor.use {
+                                    // Dummy obs: matches NOTE_phonebot_obs_action.md layout for state(52).
+                                    val obs = FloatArray(opt.meta.stateDim) { 0f }
+                                    if (obs.size >= 6) {
+                                        // gravity ~ [0,0,-1] in IMU frame
+                                        obs[3] = 0f
+                                        obs[4] = 0f
+                                        obs[5] = -1f
+                                    }
+                                    if (obs.size >= 52) {
+                                        // phase_feat at the end: [cos(L), cos(R), sin(L), sin(R)]
+                                        obs[48] = 1f   // cos(0)
+                                        obs[49] = -1f  // cos(pi)
+                                        obs[50] = 0f   // sin(0)
+                                        obs[51] = 0f   // sin(pi)
+                                    }
+                                    val out = it.run(obs)
+                                    Handler(Looper.getMainLooper()).post {
+                                        policyTestOutUi = out
+                                        policyTestStatus = "OK (stateDim=${opt.meta.stateDim}, actionDim=${opt.meta.actionDim})"
+                                    }
+                                }
+                            } catch (e: Throwable) {
+                                Handler(Looper.getMainLooper()).post {
+                                    policyTestOutUi = null
+                                    policyTestStatus = "Test failed: ${e.message}"
+                                }
+                            }
+                        }
+                    },
+                    enabled = policyOptions.isNotEmpty() && policySelected.isNotBlank(),
+                ) { Text("Test policy (one-shot)") }
+            }
+
+            MonoBlock(
+                lines =
+                    listOf(
+                        "test status : ${policyTestStatus ?: ""}",
+                        formatFloatList("test out", policyTestOutUi),
                     ),
             )
 
