@@ -283,12 +283,15 @@ INFO:     127.0.0.1:33854 - "POST /api/llm/text HTTP/1.1" 200 OK
 
 please read ::reference_note/NOTE_joystick_command.md
 
+maybe need this :: sudo apt install ros-${ROS_DISTRO}-joy
+
 ros2 run joy joy_node
 
 ros2 topic echo /joy
 ros2 topic hz /joy --window 50
 
 
+sudo apt install ros-${ROS_DISTRO}-teleop-twist-joy
 
 ros2 run teleop_twist_joy teleop_node   --ros-args --params-file joystick_config.yaml
 ros2 topic hz /cmd_vel --window 50
