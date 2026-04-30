@@ -2123,8 +2123,14 @@ fun RobotDashboardScreen(modifier: Modifier = Modifier) {
             )
 
             LaunchedEffect(policyOptions) {
-                if (policySelected.isBlank() && policyOptions.isNotEmpty()) {
-                    policySelected = policyOptions.first().tfliteFile
+                if (policyOptions.isEmpty()) return@LaunchedEffect
+                val def = PhonebotPolicyAssets.defaultSelectedFilename(policyOptions)
+                if (policySelected.isBlank()) {
+                    policySelected = def
+                } else if (policyOptions.none { it.tfliteFile == policySelected }) {
+                    // Saved selection no longer in assets (e.g. after APK update) — reset to default.
+                    policySelected = def
+                    policyOn = false
                 }
             }
 

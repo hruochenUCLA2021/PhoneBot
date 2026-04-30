@@ -26,6 +26,12 @@ data class PolicyAsset(
 object PhonebotPolicyAssets {
     const val ASSET_DIR = "exported_tflite"
 
+    /**
+     * Default policy when this `.tflite` (and matching `_metadata.json`) exists in assets.
+     * Otherwise the app falls back to the first entry in [listAvailablePolicies] (alphabetical `.tflite` order).
+     */
+    const val PREFERRED_DEFAULT_TFLITE = "phonebot_flat_alter_fv2_torque_awared_home_straight_v1_actor.tflite"
+
     fun listAvailablePolicies(context: Context): List<PolicyAsset> {
         val files = context.assets.list(ASSET_DIR)?.toList().orEmpty()
         val tflites = files.filter { it.endsWith(".tflite", ignoreCase = true) }.sorted()
@@ -37,6 +43,13 @@ object PhonebotPolicyAssets {
             out.add(PolicyAsset(tfliteFile = t, metaFile = metaGuess, meta = meta))
         }
         return out
+    }
+
+    /** Pick initial dropdown selection: preferred file if listed, else first sorted policy. */
+    fun defaultSelectedFilename(options: List<PolicyAsset>): String {
+        if (options.isEmpty()) return ""
+        return options.firstOrNull { it.tfliteFile == PREFERRED_DEFAULT_TFLITE }?.tfliteFile
+            ?: options.first().tfliteFile
     }
 
     fun readMeta(context: Context, metaFile: String): PolicyMeta? {

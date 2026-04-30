@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    # Policy files (PC paths)
+    tflite_path: "/media/hrc/T7_UBUNTU_ONLY/android_humanoid_all_files/PhoneBot/APP_workspace/app/src/main/assets/exported_tflite/phonebot_flat_alter_fv2_torque_awared_home_straight_v1_actor.tflite"
+    meta_path: "/media/hrc/T7_UBUNTU_ONLY/android_humanoid_all_files/PhoneBot/APP_workspace/app/src/main/assets/exported_tflite/phonebot_flat_alter_fv2_torque_awared_home_straight_v1_actor_metadata.json"
+
+    # Timing
+    publish_hz: 50.0
+    gait_hz: 1.5
+    num_threads: 2
+
+    # Topics
+    imu_topic: "/phonebot/imu_game"
+    motor_state_topic: "/phonebot/motor_state_full"
+    cmd_vel_topic: "/phonebot/cmd_vel"
+    motor_cmd_topic: "/phonebot/motor_cmd"
+
