@@ -20,6 +20,20 @@ setup(
             glob('model/model_phonebot/*.urdf')),
         (os.path.join('share', package_name, 'model', 'model_phonebot', 'meshes'),
             glob('model/model_phonebot/meshes/*')),
+        (os.path.join('share', package_name, 'model', 'model_phonebot_fred_v2'),
+            glob('model/model_phonebot_fred_v2/*.xml') +
+            glob('model/model_phonebot_fred_v2/*.urdf')),
+        (os.path.join('share', package_name, 'model', 'model_phonebot_fred_v2', 'meshes'),
+            glob('model/model_phonebot_fred_v2/meshes/*')),
+        (os.path.join('share', package_name, 'model', 'model_phonebot_fred_v2', 'assets'),
+            glob('model/model_phonebot_fred_v2/assets/*')),
+        (os.path.join('share', package_name, 'model', 'model_phonebot_fred_v2_torque_version'),
+            glob('model/model_phonebot_fred_v2_torque_version/*.xml') +
+            glob('model/model_phonebot_fred_v2_torque_version/*.urdf')),
+        (os.path.join('share', package_name, 'model', 'model_phonebot_fred_v2_torque_version', 'meshes'),
+            glob('model/model_phonebot_fred_v2_torque_version/meshes/*')),
+        (os.path.join('share', package_name, 'model', 'model_phonebot_fred_v2_torque_version', 'assets'),
+            glob('model/model_phonebot_fred_v2_torque_version/assets/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -31,6 +45,7 @@ setup(
     entry_points={
         'console_scripts': [
             'phonebot_visualizer = robot_visualizer.visualizer_node:main',
+            'phonebot_visualizer_official = robot_visualizer.official_visualizer_node:main',
         ],
     },
 )

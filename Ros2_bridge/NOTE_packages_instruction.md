@@ -114,11 +114,40 @@ Run:
 ros2 run robot_visualizer phonebot_visualizer --ros-args \
   -p mode:=normal \
   -p imu_topic:=/phonebot/imu_game \
-  -p motor_state_topic:=/phonebot/motor_state
+  -p motor_state_topic:=/phonebot/motor_state_full
+
+
+ros2 run robot_visualizer phonebot_visualizer --ros-args \
+  -p mode:=alter \
+  -p imu_topic:=/phonebot/imu_game \
+  -p motor_state_topic:=/phonebot/motor_state_full
 ```
 
 Notes:
 - `mode:=normal` means IMU site attached to base link; `mode:=alter` means IMU site attached to trunk link.
+
+### Official viewer version (arrows supported)
+
+If your environment has a `mujoco_viewer` incompatibility (e.g. `MjvGeom.texid` crash), use the official viewer node:
+
+```bash
+ros2 run robot_visualizer phonebot_visualizer_official --ros-args \
+  -p mode:=normal \
+  -p imu_topic:=/phonebot/imu_game \
+  -p motor_state_topic:=/phonebot/motor_state_full
+
+ros2 run robot_visualizer phonebot_visualizer_official --ros-args \
+  -p mode:=alter \
+  -p imu_topic:=/phonebot/imu_game \
+  -p motor_state_topic:=/phonebot/motor_state_full
+
+# Use fred_v2_torque_version model explicitly:
+ros2 run robot_visualizer phonebot_visualizer_official --ros-args \
+  -p model_path:=/media/hrc/T7_UBUNTU_ONLY/android_humanoid_all_files/PhoneBot/Ros2_bridge/install/robot_visualizer/share/robot_visualizer/model/model_phonebot_fred_v2_torque_version/scene_joystick_flat_terrain_alter_v2_full_collision.xml \
+  -p mode:=alter \
+  -p imu_topic:=/phonebot/imu_game \
+  -p motor_state_topic:=/phonebot/motor_state_full
+```
 
 ## `pc_policy_runner` (CMake package, PC runs TFLite policy)
 

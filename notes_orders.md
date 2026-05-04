@@ -141,6 +141,9 @@ echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
 Make it persistent (udev rule)
 sudo nano /etc/udev/rules.d/99-usb-serial.rules
 ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
+
+this one is better ::
+ACTION=="add", SUBSYSTEM=="usb-serial", DRIVERS=="ftdi_sio", ATTR{latency_timer}="1"
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 
